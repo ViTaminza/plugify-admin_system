@@ -1,0 +1,1981 @@
+{
+	"$schema": "https://raw.githubusercontent.com/untrustedmodders/plugify/refs/heads/main/schemas/plugin.schema.json",
+	"version": "${ADMIN_SYSTEM_VERSION}",
+	"name": "admin_system",
+	"description": "Administration core: admins, groups, flags/permissions, punishments (ban/mute/gag/silence), the admin menu and the plugin-facing IAdminApi. A port of the Metamod:Source plugin 'admin_system' by Pisex; the database layout (as_groups, as_admins, as_admins_servers, as_punishments, configurable prefix) is kept identical so Metamod and Plugify servers can share one database.",
+	"author": "Pisex, ported to Plugify",
+	"website": "https://github.com/untrustedmodders/plugify",
+	"license": "GPL-3.0",
+	"entry": "bin/admin_system",
+	"platforms": [],
+	"language": "cpp",
+	"dependencies": [
+		{
+			"name": "s2sdk",
+			"constraints": ">=2.18.2"
+		},
+		{
+			"name": "hudmenu",
+			"constraints": ">=1.0.0",
+			"optional": true
+		}
+	],
+	"methods": [
+		{
+			"name": "GetPluginVersion",
+			"funcName": "GetPluginVersion",
+			"group": "core",
+			"description": "Version of the admin_system plugin as a number (1.0.0 -> 1.0). The original returned the Metamod version string parsed with atof; modules only use it for display, so the same value is kept.",
+			"paramTypes": [],
+			"retType": {
+				"type": "float",
+				"description": "Plugin version."
+			}
+		},
+		{
+			"name": "GetTranslation",
+			"funcName": "GetTranslation",
+			"group": "core",
+			"description": "Phrase from admin_system.phrases.txt (the file the original loaded into its g_vecPhrases map). When the key is unknown the key itself is returned, exactly like the original. Translations are reloaded by the config reload command, so a plugify plugin should not cache the value across a reload.",
+			"paramTypes": [
+				{
+					"name": "key",
+					"type": "string",
+					"ref": false,
+					"description": "Phrase key."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Translated phrase, or the key when it is missing."
+			}
+		},
+		{
+			"name": "GetDatabaseConfig",
+			"funcName": "GetDatabaseConfig",
+			"group": "core",
+			"description": "Replacement for the original GetMySQLConnection(): instead of handing out a connection object the connection settings are exported so every plugin opens its own plgdb connection. Returns exactly 7 strings in this order: 0 driver ('mysql' or 'sqlite'), 1 host, 2 port, 3 user, 4 password, 5 database, 6 table prefix. Password and user are empty for SQLite; for SQLite entry 1 (host) carries the database file path. Use admin_system::AdminApi::GetDatabaseConfig() from admin_api.hpp to get them as a named struct.",
+			"paramTypes": [],
+			"retType": {
+				"type": "string[]",
+				"description": "driver, host, port, user, password, database, prefix."
+			}
+		},
+		{
+			"name": "GetMessageType",
+			"funcName": "GetMessageType",
+			"group": "core",
+			"description": "Value of the 'message_type' key of core.ini (0 = no action messages, 1 = without the admin name, 2 = with the admin name). Modules use it to decide how loud their own action messages are.",
+			"paramTypes": [],
+			"retType": {
+				"type": "int32",
+				"description": "message_type from core.ini."
+			}
+		},
+		{
+			"name": "IsCoreLoaded",
+			"funcName": "IsCoreLoaded",
+			"group": "core",
+			"description": "True once the database connection is up, the tables exist and the configuration has been read - i.e. after OnCoreLoaded fired. Modules that were loaded late poll this instead of waiting for a callback.",
+			"paramTypes": [],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the admin core finished loading."
+			}
+		},
+		{
+			"name": "RegisterCategory",
+			"funcName": "RegisterCategory",
+			"group": "categories",
+			"description": "Registers (or replaces) an admin menu category. The original fired every OnCategoryRegister callback before inserting the category; that order is kept, so a listener may react to the registration. name is a phrase key (translated by GetTranslation); callback may be null.",
+			"paramTypes": [
+				{
+					"name": "identity",
+					"type": "string",
+					"ref": false,
+					"description": "Category identity, e.g. 'players'."
+				},
+				{
+					"name": "name",
+					"type": "string",
+					"ref": false,
+					"description": "Phrase key used as the menu label."
+				},
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CategoryDisplayCallback",
+						"funcName": "CategoryDisplayCallback",
+						"description": "Called when the category is about to be added to the admin menu. May rewrite name - the original passed the (already translated) label by reference so a module could e.g. append a player count.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot whose menu is being built."
+							},
+							{
+								"name": "identity",
+								"type": "string",
+								"ref": false,
+								"description": "Category identity."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": true,
+								"description": "Menu label; may be modified in place."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Display callback, may be null."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RegisterItem",
+			"funcName": "RegisterItem",
+			"group": "categories",
+			"description": "Registers (or replaces) an item of a menu category. Registration is idempotent per (category, identity): registering the same identity twice replaces the previous callbacks, matching the std::map insert of the original. flags is a '|'-separated list of permissions (the original split szFlags on '|'); an empty or null string leaves the item reachable only for '@admin/root' (splitting '' produced one empty flag in the original, which only the root wildcard could match).",
+			"paramTypes": [
+				{
+					"name": "identity",
+					"type": "string",
+					"ref": false,
+					"description": "Item identity, e.g. 'ban'."
+				},
+				{
+					"name": "name",
+					"type": "string",
+					"ref": false,
+					"description": "Phrase key used as the item label."
+				},
+				{
+					"name": "category",
+					"type": "string",
+					"ref": false,
+					"description": "Identity of the owning category."
+				},
+				{
+					"name": "flags",
+					"type": "string",
+					"ref": false,
+					"description": "Permissions separated by '|'; the item is shown when the admin has any of them, or '@admin/root'."
+				},
+				{
+					"name": "display",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ItemDisplayCallback",
+						"funcName": "ItemDisplayCallback",
+						"description": "Called while the item list is built; may rewrite name in place.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot whose menu is being built."
+							},
+							{
+								"name": "category",
+								"type": "string",
+								"ref": false,
+								"description": "Category identity."
+							},
+							{
+								"name": "identity",
+								"type": "string",
+								"ref": false,
+								"description": "Item identity."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": true,
+								"description": "Item label; may be modified in place."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Display callback, may be null."
+				},
+				{
+					"name": "select",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ItemSelectCallback",
+						"funcName": "ItemSelectCallback",
+						"description": "Called when the admin picks the item. The original passed the item label as a fourth argument in addition to the identity; both are given here.",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player slot that selected the item."
+							},
+							{
+								"name": "category",
+								"type": "string",
+								"ref": false,
+								"description": "Category identity."
+							},
+							{
+								"name": "identity",
+								"type": "string",
+								"ref": false,
+								"description": "Item identity."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": false,
+								"description": "Phrase key of the item label."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Select callback, may be null."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "HasPermission",
+			"funcName": "HasPermission",
+			"group": "admins",
+			"description": "Permission check with the semantics of the original: slot -1 (console) is always true, permissions listed under 'default_permissions' in core.ini are true for everyone, '@admin/root' grants everything, and the flags loaded from the database are expanded through the 'flags' block of core.ini.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot (-1 = console)."
+				},
+				{
+					"name": "permission",
+					"type": "string",
+					"ref": false,
+					"description": "Permission line, e.g. '@admin/ban'."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the admin has the permission."
+			}
+		},
+		{
+			"name": "HasFlag",
+			"funcName": "HasFlag",
+			"group": "admins",
+			"description": "Raw flag check (no core.ini expansion, no root): exactly g_pAdmins[slot].vFlags of the original.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot (-1 = console)."
+				},
+				{
+					"name": "flag",
+					"type": "string",
+					"ref": false,
+					"description": "Single flag character, e.g. 'b'."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the admin carries the flag."
+			}
+		},
+		{
+			"name": "IsAdmin",
+			"funcName": "IsAdmin",
+			"group": "admins",
+			"description": "True when the loaded admin record has at least one flag. A player whose admins_servers row has an empty flags column is not an admin - same as the original.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot (-1 = console)."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the slot is an admin."
+			}
+		},
+		{
+			"name": "GetFlagName",
+			"funcName": "GetFlagName",
+			"group": "admins",
+			"description": "Human readable name of a flag from the 'flags' block of core.ini (its 'name' key). Empty string for an unknown flag.",
+			"paramTypes": [
+				{
+					"name": "flag",
+					"type": "string",
+					"ref": false,
+					"description": "Single flag character."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Flag name or an empty string."
+			}
+		},
+		{
+			"name": "GetPermissionsByFlag",
+			"funcName": "GetPermissionsByFlag",
+			"group": "admins",
+			"description": "Expands one flag into the permissions listed under its 'access' block in core.ini. Empty for an unknown flag.",
+			"paramTypes": [
+				{
+					"name": "flag",
+					"type": "string",
+					"ref": false,
+					"description": "Single flag character."
+				}
+			],
+			"retType": {
+				"type": "string[]",
+				"description": "Permissions granted by the flag."
+			}
+		},
+		{
+			"name": "GetAdminFlags",
+			"funcName": "GetAdminFlags",
+			"group": "admins",
+			"description": "Flags of a loaded admin (database flags plus group flags, deduplicated across servers in load order). Empty when the slot is not an admin.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "string[]",
+				"description": "Flag characters."
+			}
+		},
+		{
+			"name": "GetAdminPermissions",
+			"funcName": "GetAdminPermissions",
+			"group": "admins",
+			"description": "Permissions of a loaded admin, i.e. the union of GetPermissionsByFlag() over its flags. '@admin/root' is included when the admin has the z flag.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "string[]",
+				"description": "Permission lines."
+			}
+		},
+		{
+			"name": "GetAdminImmunity",
+			"funcName": "GetAdminImmunity",
+			"group": "admins",
+			"description": "Immunity of a loaded admin: the maximum of the admins_servers.immunity and groups.immunity values over the servers that matched admin_server_id.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "Immunity value (0 when not an admin)."
+			}
+		},
+		{
+			"name": "GetAdminExpireTime",
+			"funcName": "GetAdminExpireTime",
+			"group": "admins",
+			"description": "Absolute unix timestamp at which the admin loses the rights of this server, 0 = permanent, -1 = no row loaded. The original returned an int; the value is widened to int64 here because the timestamp is stored as a 32 bit unix time that overflows in 2038.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "int64",
+				"description": "Expiry timestamp, 0 (never) or -1 (none)."
+			}
+		},
+		{
+			"name": "GetAdminName",
+			"funcName": "GetAdminName",
+			"group": "admins",
+			"description": "Name of a loaded admin: the name column of as_admins, or the player name when the column is NULL and static_name is disabled. 'Console' for slot -1, empty string for an invalid slot.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Admin name."
+			}
+		},
+		{
+			"name": "GetAdminGroupID",
+			"funcName": "GetAdminGroupID",
+			"group": "admins",
+			"description": "Database id of the group of a loaded admin, -1 when the admin has no group or is not an admin.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "int32",
+				"description": "Group id or -1."
+			}
+		},
+		{
+			"name": "GetAdminGroupName",
+			"funcName": "GetAdminGroupName",
+			"group": "admins",
+			"description": "Name of the group of a loaded admin, empty when there is none.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Group name."
+			}
+		},
+		{
+			"name": "GetImmunityType",
+			"funcName": "GetImmunityType",
+			"group": "admins",
+			"description": "Value of the 'immunity_type' key of core.ini (0 = immunity ignored, 1 = equal immunity may punish, 2 = strictly higher immunity needed, 3 = admins cannot punish each other). Kept for parity; the core applies the rules itself in TryAddPunishment.",
+			"paramTypes": [],
+			"retType": {
+				"type": "int32",
+				"description": "immunity_type from core.ini."
+			}
+		},
+		{
+			"name": "AddPlayerAdmin",
+			"funcName": "AddPlayerAdmin",
+			"group": "admins",
+			"description": "Creates (or extends) an admin in as_admins / as_admins_servers for the current server, with the SQL of the original: an existing as_admins row is reused, the admins_servers row is INSERT IGNORE'd (so an existing row for this server is kept), and the rights of an online player are reloaded afterwards. expireTime is a duration in seconds from now, 0 = permanent. When db is false nothing is written and only the in-memory record of an online player changes.",
+			"paramTypes": [
+				{
+					"name": "name",
+					"type": "string",
+					"ref": false,
+					"description": "Steam name stored in as_admins.name."
+				},
+				{
+					"name": "steamid64",
+					"type": "string",
+					"ref": false,
+					"description": "SteamID64 of the admin."
+				},
+				{
+					"name": "flags",
+					"type": "string",
+					"ref": false,
+					"description": "Flag characters, e.g. 'abz'."
+				},
+				{
+					"name": "immunity",
+					"type": "int32",
+					"ref": false,
+					"description": "Immunity of the admins_servers row."
+				},
+				{
+					"name": "expireTime",
+					"type": "int32",
+					"ref": false,
+					"description": "Lifetime in seconds from now, 0 = permanent."
+				},
+				{
+					"name": "groupID",
+					"type": "int32",
+					"ref": false,
+					"description": "as_groups.id, 0 = no group."
+				},
+				{
+					"name": "comment",
+					"type": "string",
+					"ref": false,
+					"description": "Comment for a newly created as_admins row."
+				},
+				{
+					"name": "db",
+					"type": "bool",
+					"ref": false,
+					"description": "false = change the in-memory record only."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RemovePlayerAdmin",
+			"funcName": "RemovePlayerAdmin",
+			"group": "admins",
+			"description": "Removes the admin rights of a steamid: deletes the admins_servers row for this server and, when no other server uses the admin, the as_admins row as well. Online players with that steamid lose their flags immediately.",
+			"paramTypes": [
+				{
+					"name": "steamid64",
+					"type": "string",
+					"ref": false,
+					"description": "SteamID64 of the admin."
+				},
+				{
+					"name": "db",
+					"type": "bool",
+					"ref": false,
+					"description": "false = change the in-memory record only."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "AddPlayerLocalFlag",
+			"funcName": "AddPlayerLocalFlag",
+			"group": "admins",
+			"description": "Appends a flag to the in-memory record of a slot without touching the database. The permission list is NOT recomputed (this is what the original did), so HasPermission() does not see the new flag until the next load - use AddPlayerLocalPermission for permissions. Kept for parity; VIP_Permissions is such a user.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "flag",
+					"type": "string",
+					"ref": false,
+					"description": "Flag character."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RemovePlayerLocalFlag",
+			"funcName": "RemovePlayerLocalFlag",
+			"group": "admins",
+			"description": "Removes every occurrence of a flag from the in-memory record of a slot.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "flag",
+					"type": "string",
+					"ref": false,
+					"description": "Flag character."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "AddPlayerLocalPermission",
+			"funcName": "AddPlayerLocalPermission",
+			"group": "admins",
+			"description": "Appends a permission line to the in-memory record of a slot without touching the database - the way VIP_Permissions makes a player an admin for one round.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "permission",
+					"type": "string",
+					"ref": false,
+					"description": "Permission line, e.g. '@admin/vip'."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RemovePlayerLocalPermission",
+			"funcName": "RemovePlayerLocalPermission",
+			"group": "admins",
+			"description": "Removes every occurrence of a permission line from the in-memory record of a slot.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "permission",
+					"type": "string",
+					"ref": false,
+					"description": "Permission line."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "AddPlayerLocalImmunity",
+			"funcName": "AddPlayerLocalImmunity",
+			"group": "admins",
+			"description": "Overwrites the in-memory immunity of a slot (the original assignment, not a maximum).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "immunity",
+					"type": "int32",
+					"ref": false,
+					"description": "New immunity value."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RemovePlayerLocalImmunity",
+			"funcName": "RemovePlayerLocalImmunity",
+			"group": "admins",
+			"description": "Resets the in-memory immunity of a slot to 0.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "IsPlayerPunished",
+			"funcName": "IsPlayerPunished",
+			"group": "punishments",
+			"description": "True while the slot carries an active punishment of that type. Note that the original answered true before the punishments of a player had been loaded (the array started at 0); here every slot starts at 'none', which the ported modules (VoteBKM) rely on.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the punishment is active."
+			}
+		},
+		{
+			"name": "GetPlayerPunishmentExpired",
+			"funcName": "GetPlayerPunishmentExpired",
+			"group": "punishments",
+			"description": "Expiry of the active punishment of a slot: absolute unix timestamp, 0 = permanent, -1 = no punishment. The original returned an int and stored the timestamp in a 32 bit array; the value is widened to int64 here so the 2038 wraparound of the original cannot happen.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				}
+			],
+			"retType": {
+				"type": "int64",
+				"description": "Expiry timestamp, 0 or -1."
+			}
+		},
+		{
+			"name": "GetPlayerPunishmentReason",
+			"funcName": "GetPlayerPunishmentReason",
+			"group": "punishments",
+			"description": "Reason of the active punishment of a slot, empty when there is none. Used for the 'you are muted for X (reason)' chat message.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				}
+			],
+			"retType": {
+				"type": "string",
+				"description": "Punishment reason."
+			}
+		},
+		{
+			"name": "AddPlayerPunishment",
+			"funcName": "AddPlayerPunishment",
+			"group": "punishments",
+			"description": "Punishes a connected player: inserts the as_punishments row (name, steamid, ip when punish_ip is on, admin_id, created, expires, reason, server_id, punish_type), updates the in-memory state and notifies the OnPlayerPunish listeners. A ban additionally asks the core to disconnect the player after ban_delay seconds. time is a duration in seconds, 0 = permanent. adminID is the slot of the punishing admin, -1 = console.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Slot of the punished player."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				},
+				{
+					"name": "time",
+					"type": "int32",
+					"ref": false,
+					"description": "Duration in seconds, 0 = permanent."
+				},
+				{
+					"name": "reason",
+					"type": "string",
+					"ref": false,
+					"description": "Punishment reason."
+				},
+				{
+					"name": "adminID",
+					"type": "int32",
+					"ref": false,
+					"description": "Slot of the admin, -1 = console."
+				},
+				{
+					"name": "notify",
+					"type": "bool",
+					"ref": false,
+					"description": "false = send no chat message (callers that print their own)."
+				},
+				{
+					"name": "db",
+					"type": "bool",
+					"ref": false,
+					"description": "false = punish in memory only."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "AddOfflinePlayerPunishment",
+			"funcName": "AddOfflinePlayerPunishment",
+			"group": "punishments",
+			"description": "Punishes a player that is not connected: inserts the as_punishments row (without an ip) and notifies the OnOfflinePlayerPunish listeners. Immunity is respected first - the target's immunity is read from the database, and when it is high enough (immunity_type 1/2/3) nothing happens.",
+			"paramTypes": [
+				{
+					"name": "steamid64",
+					"type": "string",
+					"ref": false,
+					"description": "SteamID64 of the target."
+				},
+				{
+					"name": "name",
+					"type": "string",
+					"ref": false,
+					"description": "Last known name of the target."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				},
+				{
+					"name": "time",
+					"type": "int32",
+					"ref": false,
+					"description": "Duration in seconds, 0 = permanent."
+				},
+				{
+					"name": "reason",
+					"type": "string",
+					"ref": false,
+					"description": "Punishment reason."
+				},
+				{
+					"name": "adminID",
+					"type": "int32",
+					"ref": false,
+					"description": "Slot of the admin, -1 = console."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RemovePlayerPunishment",
+			"funcName": "RemovePlayerPunishment",
+			"group": "punishments",
+			"description": "Lifts the active punishment of a connected player: sets unpunish_admin_id on the matching as_punishments rows, clears the in-memory state and notifies the OnPlayerUnpunish listeners. With unpunish_type 0 an admin may only lift punishments they issued themselves, unless they have '@admin/unpunish_all' (or are the console).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Slot of the punished player."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				},
+				{
+					"name": "adminID",
+					"type": "int32",
+					"ref": false,
+					"description": "Slot of the admin, -1 = console."
+				},
+				{
+					"name": "notify",
+					"type": "bool",
+					"ref": false,
+					"description": "false = send no chat message."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "RemoveOfflinePlayerPunishment",
+			"funcName": "RemoveOfflinePlayerPunishment",
+			"group": "punishments",
+			"description": "Lifts the punishment of a player that is not connected. When unpunish_type is 0 and the caller is neither the console nor the holder of '@admin/unpunish_all', only rows whose admin_id is the caller are touched (the original added 'AND admin_id = <caller>').",
+			"paramTypes": [
+				{
+					"name": "steamid64",
+					"type": "string",
+					"ref": false,
+					"description": "SteamID64 of the target."
+				},
+				{
+					"name": "type",
+					"type": "int32",
+					"ref": false,
+					"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+				},
+				{
+					"name": "adminID",
+					"type": "int32",
+					"ref": false,
+					"description": "Slot of the admin, -1 = console."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "ShowAdminMenu",
+			"funcName": "ShowAdminMenu",
+			"group": "menus",
+			"description": "Opens the main admin menu of a player (the original OnAdminMenu). Does nothing when the player is not an admin.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "ShowAdminCategoryMenu",
+			"funcName": "ShowAdminCategoryMenu",
+			"group": "menus",
+			"description": "Opens one category of the admin menu and remembers it as the 'last category' so the back button works.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "category",
+					"type": "string",
+					"ref": false,
+					"description": "Category identity."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "ShowAdminLastCategoryMenu",
+			"funcName": "ShowAdminLastCategoryMenu",
+			"group": "menus",
+			"description": "Re-opens the category the player looked at last - the call modules make after a submenu was closed.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "ShowAdminItemMenu",
+			"funcName": "ShowAdminItemMenu",
+			"group": "menus",
+			"description": "Invokes the select callback of one menu item, i.e. what the admin menu did when the item was picked.",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot."
+				},
+				{
+					"name": "category",
+					"type": "string",
+					"ref": false,
+					"description": "Category identity."
+				},
+				{
+					"name": "identity",
+					"type": "string",
+					"ref": false,
+					"description": "Item identity."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "SendAction",
+			"funcName": "SendAction",
+			"group": "actions",
+			"description": "Broadcasts a named action with one parameter to every OnAction listener - the generic hook the original added so modules could talk to each other (e.g. CheckCheats announcing a verdict, Admins asking for a menu).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player the action is about, -1 when there is none."
+				},
+				{
+					"name": "action",
+					"type": "string",
+					"ref": false,
+					"description": "Action name."
+				},
+				{
+					"name": "param",
+					"type": "string",
+					"ref": false,
+					"description": "Action parameter (modules pass numbers or strings, e.g. '7 3600 reason')."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnAdminConnected_Register",
+			"funcName": "OnAdminConnected_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) callback of the calling plugin for the OnAdminConnected event. The original keyed listeners by PluginId, so one plugin had exactly one listener; registering again replaces it. The callback fires once per successful admin load (a player was found in as_admins), not for ordinary players.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "AdminConnectedCallback",
+						"funcName": "AdminConnectedCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot whose rights were (re)loaded."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnAdminConnected_Unregister",
+			"funcName": "OnAdminConnected_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnAdminConnected listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "AdminConnectedCallback",
+						"funcName": "AdminConnectedCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot whose rights were (re)loaded."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnCoreLoaded_Register",
+			"funcName": "OnCoreLoaded_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnCoreLoaded listener of the calling plugin. It fires as soon as the database is up and the tables exist; a plugin that registers later and sees IsCoreLoaded() == true must run its start logic immediately, because the event will not fire twice.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CoreLoadedCallback",
+						"funcName": "CoreLoadedCallback",
+						"paramTypes": [],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnCoreLoaded_Unregister",
+			"funcName": "OnCoreLoaded_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnCoreLoaded listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CoreLoadedCallback",
+						"funcName": "CoreLoadedCallback",
+						"paramTypes": [],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnCategoryRegister_Register",
+			"funcName": "OnCategoryRegister_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnCategoryRegister listener of the calling plugin. It fires for every RegisterCategory call, including the ones of the admin core itself, so it can be used to filter or re-order categories as they appear.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CategoryRegisterCallback",
+						"funcName": "CategoryRegisterCallback",
+						"paramTypes": [
+							{
+								"name": "identity",
+								"type": "string",
+								"ref": false,
+								"description": "Identity of the registered category."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnCategoryRegister_Unregister",
+			"funcName": "OnCategoryRegister_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnCategoryRegister listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "CategoryRegisterCallback",
+						"funcName": "CategoryRegisterCallback",
+						"paramTypes": [
+							{
+								"name": "identity",
+								"type": "string",
+								"ref": false,
+								"description": "Identity of the registered category."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnAction_Register",
+			"funcName": "OnAction_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnAction listener of the calling plugin, i.e. the receiving end of SendAction.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ActionCallback",
+						"funcName": "ActionCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player the action is about, -1 when there is none."
+							},
+							{
+								"name": "action",
+								"type": "string",
+								"ref": false,
+								"description": "Action name."
+							},
+							{
+								"name": "param",
+								"type": "string",
+								"ref": false,
+								"description": "Action parameter."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnAction_Unregister",
+			"funcName": "OnAction_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnAction listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "ActionCallback",
+						"funcName": "ActionCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player the action is about, -1 when there is none."
+							},
+							{
+								"name": "action",
+								"type": "string",
+								"ref": false,
+								"description": "Action name."
+							},
+							{
+								"name": "param",
+								"type": "string",
+								"ref": false,
+								"description": "Action parameter."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerPunish_Register",
+			"funcName": "OnPlayerPunish_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnPlayerPunish listener of the calling plugin. Fires after a connected player got punished, and when the punishments of a player are force-reloaded (mm_as_reload_punish).",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerPunishCallback",
+						"funcName": "PlayerPunishCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Punished player slot."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds (0 = permanent); on a reload it is the remaining time of the stored punishment."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin that issued it, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerPunish_Unregister",
+			"funcName": "OnPlayerPunish_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerPunish listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerPunishCallback",
+						"funcName": "PlayerPunishCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Punished player slot."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds (0 = permanent); on a reload it is the remaining time of the stored punishment."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin that issued it, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnOfflinePlayerPunish_Register",
+			"funcName": "OnOfflinePlayerPunish_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnOfflinePlayerPunish listener of the calling plugin. Fires after a player that is not connected got punished.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "OfflinePlayerPunishCallback",
+						"funcName": "OfflinePlayerPunishCallback",
+						"paramTypes": [
+							{
+								"name": "steamid64",
+								"type": "string",
+								"ref": false,
+								"description": "SteamID64 of the punished player."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": false,
+								"description": "Last known name."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds, 0 = permanent."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnOfflinePlayerPunish_Unregister",
+			"funcName": "OnOfflinePlayerPunish_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnOfflinePlayerPunish listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "OfflinePlayerPunishCallback",
+						"funcName": "OfflinePlayerPunishCallback",
+						"paramTypes": [
+							{
+								"name": "steamid64",
+								"type": "string",
+								"ref": false,
+								"description": "SteamID64 of the punished player."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": false,
+								"description": "Last known name."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds, 0 = permanent."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerUnpunish_Register",
+			"funcName": "OnPlayerUnpunish_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnPlayerUnpunish listener of the calling plugin. Fires after the punishment of a connected player was lifted.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerUnpunishCallback",
+						"funcName": "PlayerUnpunishCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player whose punishment was lifted."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin that lifted it, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerUnpunish_Unregister",
+			"funcName": "OnPlayerUnpunish_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerUnpunish listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerUnpunishCallback",
+						"funcName": "PlayerUnpunishCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Player whose punishment was lifted."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin that lifted it, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnOfflinePlayerUnpunish_Register",
+			"funcName": "OnOfflinePlayerUnpunish_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnOfflinePlayerUnpunish listener of the calling plugin. Fires after the punishment of a player that is not connected was lifted.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "OfflinePlayerUnpunishCallback",
+						"funcName": "OfflinePlayerUnpunishCallback",
+						"paramTypes": [
+							{
+								"name": "steamid64",
+								"type": "string",
+								"ref": false,
+								"description": "SteamID64 of the player."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnOfflinePlayerUnpunish_Unregister",
+			"funcName": "OnOfflinePlayerUnpunish_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnOfflinePlayerUnpunish listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "OfflinePlayerUnpunishCallback",
+						"funcName": "OfflinePlayerUnpunishCallback",
+						"paramTypes": [
+							{
+								"name": "steamid64",
+								"type": "string",
+								"ref": false,
+								"description": "SteamID64 of the player."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "void"
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerPunishPre_Register",
+			"funcName": "OnPlayerPunishPre_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnPlayerPunishPre listener of the calling plugin. It runs before a connected player is punished and can veto the punishment by returning true - exactly the 'true means block' convention of the original.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerPunishPreCallback",
+						"funcName": "PlayerPunishPreCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot about to be punished."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds, 0 = permanent."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "bool",
+							"description": "true = block the punishment."
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnPlayerPunishPre_Unregister",
+			"funcName": "OnPlayerPunishPre_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnPlayerPunishPre listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "PlayerPunishPreCallback",
+						"funcName": "PlayerPunishPreCallback",
+						"paramTypes": [
+							{
+								"name": "slot",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot about to be punished."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds, 0 = permanent."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "bool",
+							"description": "true = block the punishment."
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnOfflinePlayerPunishPre_Register",
+			"funcName": "OnOfflinePlayerPunishPre_Register",
+			"group": "callbacks",
+			"description": "Registers the (single) OnOfflinePlayerPunishPre listener of the calling plugin. It runs before a player that is not connected is punished and can veto the punishment by returning true.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "OfflinePlayerPunishPreCallback",
+						"funcName": "OfflinePlayerPunishPreCallback",
+						"paramTypes": [
+							{
+								"name": "steamid64",
+								"type": "string",
+								"ref": false,
+								"description": "SteamID64 of the target."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": false,
+								"description": "Last known name."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds, 0 = permanent."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "bool",
+							"description": "true = block the punishment."
+						}
+					},
+					"description": "Function to invoke."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		},
+		{
+			"name": "OnOfflinePlayerPunishPre_Unregister",
+			"funcName": "OnOfflinePlayerPunishPre_Unregister",
+			"group": "callbacks",
+			"description": "Removes the OnOfflinePlayerPunishPre listener registered by this plugin. Idempotent.",
+			"paramTypes": [
+				{
+					"name": "callback",
+					"type": "function",
+					"ref": false,
+					"prototype": {
+						"name": "OfflinePlayerPunishPreCallback",
+						"funcName": "OfflinePlayerPunishPreCallback",
+						"paramTypes": [
+							{
+								"name": "steamid64",
+								"type": "string",
+								"ref": false,
+								"description": "SteamID64 of the target."
+							},
+							{
+								"name": "name",
+								"type": "string",
+								"ref": false,
+								"description": "Last known name."
+							},
+							{
+								"name": "type",
+								"type": "int32",
+								"ref": false,
+								"description": "0 = ban, 1 = mute, 2 = gag, 3 = silence."
+							},
+							{
+								"name": "time",
+								"type": "int32",
+								"ref": false,
+								"description": "Duration in seconds, 0 = permanent."
+							},
+							{
+								"name": "reason",
+								"type": "string",
+								"ref": false,
+								"description": "Punishment reason."
+							},
+							{
+								"name": "adminID",
+								"type": "int32",
+								"ref": false,
+								"description": "Slot of the admin, -1 = console."
+							}
+						],
+						"retType": {
+							"type": "bool",
+							"description": "true = block the punishment."
+						}
+					},
+					"description": "Function to remove."
+				}
+			],
+			"retType": {
+				"type": "void"
+			}
+		}
+	]
+}
