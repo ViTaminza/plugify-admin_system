@@ -548,6 +548,32 @@ bool AdminCore::IsAdmin(int slot) const {
 	return m_admins[static_cast<size_t>(slot)].IsAdmin();
 }
 
+AdminLoadSnapshot AdminCore::LoadSnapshot(int slot) const {
+	const SlotState* state = FindSlot(slot);
+	if (state == nullptr) {
+		return {}; // console or out of range: nothing was ever requested for such a slot
+	}
+	AdminLoadSnapshot snapshot;
+	snapshot.state = state->load;
+	snapshot.steamid = state->load_steamid;
+	snapshot.generation = state->generation;
+	snapshot.request = state->request;
+	return snapshot;
+}
+
+bool AdminCore::IsAdminDataReady(int slot, uint64_t steamid) const {
+	// steamid 0 = the identity is not known (a bot, a connecting client, a failed lookup): there
+	// is nothing the loaded answer could be matched against, so it is never "ready".
+	if (steamid == 0) {
+		return false;
+	}
+	const SlotState* state = FindSlot(slot);
+	if (state == nullptr) {
+		return false; // slot -1 (console) and out-of-range slots have no client admin data
+	}
+	return state->load == AdminLoadState::Ready && state->load_steamid == steamid;
+}
+
 void AdminCore::AddLocalFlag(int slot, std::string_view flag) {
 	if (SlotInRange(slot) && !flag.empty()) {
 		m_admins[static_cast<size_t>(slot)].flags.emplace_back(flag);
@@ -602,14 +628,22 @@ void AdminCore::ResetSlot(int slot) {
 	if (state == nullptr) {
 		return;
 	}
+	// The generation invalidates every answer still in flight; the load state belongs to the old
+	// generation, so the slot is back to "nothing loaded" (a consumer must not trust its previous
+	// snapshot for this slot any more). `request` keeps counting: an even later load of the new
+	// generation must not match a stale answer either.
 	++state->generation;
+	state->load = AdminLoadState::Unknown;
+	state->load_steamid = 0;
 	ResetPunishments(slot);
 	m_admins[static_cast<size_t>(slot)].Clear();
 }
 
 int64_t AdminCore::AdminDbId(int slot) const {
-	// The original used 1 (the console row) for admin_id when there was no admin.
-	return slot == -1 ? 1 : m_admins[static_cast<size_t>(slot)].id;
+	// The original used 1 (the console row) for admin_id when there was no admin. Slot -1 and an
+	// out-of-range value (the exports take the adminID from other plugins unchecked) both mean
+	// "console": they must never index the per-slot array.
+	return SlotInRange(slot) ? m_admins[static_cast<size_t>(slot)].id : 1;
 }
 
 uint64_t AdminCore::AdminSteamId(int slot) const {
@@ -627,24 +661,65 @@ void AdminCore::LoadAdmin(int slot, uint64_t steamid, std::string player_name) {
 	// empty (non-admin) record behind.
 	m_admins[static_cast<size_t>(slot)].Clear();
 	m_admins[static_cast<size_t>(slot)].steamid = steamid;
+	// Two answers can be in flight for the same slot generation (a retry while the previous
+	// statement still sits in the plgdb queue). The request id makes only the newest one
+	// authoritative, so a slow earlier answer cannot overwrite the newer state.
 	const uint64_t generation = state->generation;
+	const uint64_t request = ++state->request;
+	state->load = AdminLoadState::Pending;
+	state->load_steamid = steamid;
 
 	Query(BuildAdminSelect() + " WHERE a.steamid = ?", {SteamIdText(steamid)},
-		  [this, slot, generation, steamid, player_name = std::move(player_name)](const plgdb::Result& result) {
+		  [this, slot, generation, request, steamid, player_name = std::move(player_name)](const plgdb::Result& result) {
+			  SlotState* current = FindSlot(slot);
+			  if (current == nullptr || current->generation != generation || current->request != request) {
+				  return; // the slot was reset/reused or a newer load supersedes this answer
+			  }
 			  if (!result.Ok()) {
+				  // The record is NOT authoritative: IsAdmin()/HasPermission() stay false, and the
+				  // plugin retries the SELECT (with its own backoff) until it answers.
+				  current->load = AdminLoadState::Failed;
+				  current->load_steamid = steamid;
 				  ReportError("admin_system: loading the admin of " + SteamIdText(steamid) + " failed: " + result.Error());
 				  return;
 			  }
-			  const SlotState* current = FindSlot(slot);
-			  if (current == nullptr || current->generation != generation) {
-				  return; // the slot was reset (or reused) while the query was in flight
-			  }
 			  if (result.RowCount() == 0) {
-				  return; // PARITY: no row, no OnAdminConnected
+				  // Even "no rows" is a finished answer (a definitive "this player is not an admin");
+				  // nothing has to be parsed or applied, the record was cleared when the load was
+				  // requested. PARITY: no row, no OnAdminConnected.
+				  current->load = AdminLoadState::Ready;
+				  current->load_steamid = steamid;
+				  return;
 			  }
-			  AdminRecord record = ComputeAdminRecord(ParseAdminRows(result), m_config, player_name);
-			  record.steamid = steamid;
-			  m_admins[static_cast<size_t>(slot)] = std::move(record);
+			  // Build AND store the record before claiming readiness. Parsing/allocating can throw
+			  // (a damaged result set, std::bad_alloc); claiming Ready first would leave a slot the
+			  // consumer is told to trust with the cleared record - e.g. a reserve admin could be
+			  // kicked on an empty permission list. A throw is handled like a failed SELECT: the
+			  // slot goes Failed (not authoritative) and the plugin retries it.
+			  try {
+				  const std::vector<AdminRow> rows = ParseAdminRows(result);
+				  if (onAdminRowsParsed) {
+					  onAdminRowsParsed(rows);
+				  }
+				  AdminRecord record = ComputeAdminRecord(rows, m_config, player_name);
+				  record.steamid = steamid;
+				  m_admins[static_cast<size_t>(slot)] = std::move(record);
+			  } catch (const std::exception& ex) {
+				  current->load = AdminLoadState::Failed;
+				  current->load_steamid = steamid;
+				  ReportError("admin_system: reading the admin row of " + SteamIdText(steamid) + " failed: " + ex.what());
+				  return;
+			  } catch (...) {
+				  current->load = AdminLoadState::Failed;
+				  current->load_steamid = steamid;
+				  ReportError("admin_system: reading the admin row of " + SteamIdText(steamid) +
+							  " failed with an unknown exception");
+				  return;
+			  }
+			  // The record is in place: only now is the answer authoritative, and only now may the
+			  // hook run (a consumer reacting to it sees the finished record and a Ready snapshot).
+			  current->load = AdminLoadState::Ready;
+			  current->load_steamid = steamid;
 			  if (onAdminLoaded) {
 				  onAdminLoaded(slot, m_admins[static_cast<size_t>(slot)]);
 			  }
@@ -791,11 +866,18 @@ bool AdminCore::TryPunish(const PlayerIdentity& player, int type, int time, std:
 	return Punish(player, type, time, std::move(reason), admin_slot);
 }
 
-void AdminCore::PunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot) {
+void AdminCore::PunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot,
+							  std::function<void(bool)> onComplete) {
 	if (steamid64.empty() || type < 0 || type >= kPunishmentTypes) {
+		if (onComplete) {
+			onComplete(false);
+		}
 		return;
 	}
 	if (onOfflinePlayerPunishPre && onOfflinePlayerPunishPre(steamid64, name, type, time, reason, admin_slot)) {
+		if (onComplete) {
+			onComplete(false);
+		}
 		return;
 	}
 	const int64_t now = Now();
@@ -803,9 +885,16 @@ void AdminCore::PunishOffline(std::string steamid64, std::string name, int type,
 	Query("INSERT INTO {p}punishments (name, steamid, admin_id, created, expires, reason, server_id, punish_type) "
 		  "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
 		  {name, steamid64, AdminDbId(admin_slot), now, expires, reason, m_config.punish_server_id, static_cast<int64_t>(type)},
-		  [this](const plgdb::Result& result) {
+		  [this, onComplete](const plgdb::Result& result) {
 			  if (!result.Ok()) {
 				  ReportError("admin_system: storing an offline punishment failed: " + result.Error());
+				  if (onComplete) {
+					  onComplete(false);
+				  }
+				  return;
+			  }
+			  if (onComplete) {
+				  onComplete(true);
 			  }
 		  });
 	if (onOfflinePlayerPunish) {
@@ -813,10 +902,11 @@ void AdminCore::PunishOffline(std::string steamid64, std::string name, int type,
 	}
 }
 
-void AdminCore::TryPunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot) {
+void AdminCore::TryPunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot,
+								 std::function<void(bool)> onComplete) {
 	if (admin_slot == -1 || steamid64.empty()) {
 		// PARITY: console (or an unknown caller) skips the immunity query entirely.
-		PunishOffline(std::move(steamid64), std::move(name), type, time, std::move(reason), admin_slot);
+		PunishOffline(std::move(steamid64), std::move(name), type, time, std::move(reason), admin_slot, std::move(onComplete));
 		return;
 	}
 	const AdminRecord* admin = FindAdmin(admin_slot);
@@ -830,9 +920,13 @@ void AdminCore::TryPunishOffline(std::string steamid64, std::string name, int ty
 		params.emplace_back(static_cast<int64_t>(m_config.punish_server_id));
 	}
 	Query(std::move(sql), std::move(params),
-		  [this, steamid64, name, type, time, reason, admin_slot, admin_immunity](const plgdb::Result& result) {
+		  [this, steamid64, name, type, time, reason, admin_slot, admin_immunity,
+		   onComplete](const plgdb::Result& result) {
 			  if (!result.Ok()) {
 				  ReportError("admin_system: reading the immunity of " + steamid64 + " failed: " + result.Error());
+				  if (onComplete) {
+					  onComplete(false);
+				  }
 				  return;
 			  }
 			  int target_immunity = 0;
@@ -845,9 +939,12 @@ void AdminCore::TryPunishOffline(std::string steamid64, std::string name, int ty
 				  }
 			  }
 			  if (!CanPunish(admin_slot, admin_immunity, target_immunity, m_config.immunity_type)) {
+				  if (onComplete) {
+					  onComplete(false);
+				  }
 				  return;
 			  }
-			  PunishOffline(steamid64, name, type, time, reason, admin_slot);
+			  PunishOffline(steamid64, name, type, time, reason, admin_slot, onComplete);
 		  });
 }
 
@@ -991,16 +1088,23 @@ void AdminCore::Unpunish(int slot, int type, int admin_slot) {
 		  "AND (expires > ? OR expires = 0) AND server_id = ?",
 		  {AdminDbId(admin_slot), SteamIdText(steamid), static_cast<int64_t>(type), Now(),
 		   static_cast<int64_t>(m_config.punish_server_id)},
-		  [this](const plgdb::Result& result) {
+		  [this, slot, type, admin_slot](const plgdb::Result& result) {
 			  if (!result.Ok()) {
 				  ReportError("admin_system: lifting a punishment failed: " + result.Error());
+				  return;
+			  }
+			  // The original checked the row first: a row of another server (or one that was
+			  // already lifted) must not be reported to the modules, or a BlockDB ban would be
+			  // deleted without the local row having changed.
+			  if (result.AffectedRows() == 0) {
+				  return;
+			  }
+			  if (onPlayerUnpunish) {
+				  onPlayerUnpunish(slot, type, admin_slot);
 			  }
 		  });
 
 	m_punishments[static_cast<size_t>(slot)][static_cast<size_t>(type)] = Punishment{};
-	if (onPlayerUnpunish) {
-		onPlayerUnpunish(slot, type, admin_slot);
-	}
 }
 
 void AdminCore::UnpunishOffline(std::string steamid64, int type, int admin_slot) {
@@ -1019,14 +1123,23 @@ void AdminCore::UnpunishOffline(std::string steamid64, int type, int admin_slot)
 	sql += " AND server_id = ?";
 	params.emplace_back(static_cast<int64_t>(m_config.punish_server_id));
 
-	Query(std::move(sql), std::move(params), [this](const plgdb::Result& result) {
-		if (!result.Ok()) {
-			ReportError("admin_system: lifting an offline punishment failed: " + result.Error());
-		}
-	});
-	if (onOfflinePlayerUnpunish) {
-		onOfflinePlayerUnpunish(steamid64, type, admin_slot);
-	}
+	Query(std::move(sql), std::move(params),
+		  [this, steamid64, type, admin_slot](const plgdb::Result& result) {
+			  if (!result.Ok()) {
+				  ReportError("admin_system: lifting an offline punishment failed: " + result.Error());
+				  return;
+			  }
+			  // Only a lifted row is a real unpunishment: the UPDATE adds the unpunish_type and
+			  // server_id filters, so 0 affected rows means nothing was lifted (the original
+			  // checked that with a SELECT first). Firing the hook anyway makes as_blockdb delete
+			  // the ban server-wide while the local row stays.
+			  if (result.AffectedRows() == 0) {
+				  return;
+			  }
+			  if (onOfflinePlayerUnpunish) {
+				  onOfflinePlayerUnpunish(steamid64, type, admin_slot);
+			  }
+		  });
 }
 
 void AdminCore::RemoveExpiredAdmins() {

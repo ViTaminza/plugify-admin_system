@@ -24,6 +24,7 @@
         HasPermission;
         HasFlag;
         IsAdmin;
+        IsClientAdminDataReady;
         GetFlagName;
         GetPermissionsByFlag;
         GetAdminFlags;

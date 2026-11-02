@@ -25,7 +25,7 @@
 			"name": "GetPluginVersion",
 			"funcName": "GetPluginVersion",
 			"group": "core",
-			"description": "Version of the admin_system plugin as a number (1.0.0 -> 1.0). The original returned the Metamod version string parsed with atof; modules only use it for display, so the same value is kept.",
+			"description": "Version of the admin_system plugin as a number (1.2.0 -> 1.2). The original returned the Metamod version string parsed with atof; modules only use it for display, so the same value is kept.",
 			"paramTypes": [],
 			"retType": {
 				"type": "float",
@@ -319,6 +319,30 @@
 			"retType": {
 				"type": "bool",
 				"description": "Whether the slot is an admin."
+			}
+		},
+		{
+			"name": "IsClientAdminDataReady",
+			"funcName": "IsClientAdminDataReady",
+			"group": "admins",
+			"description": "True when the admin data of exactly this player has been loaded for the slot, i.e. the asynchronous admin SELECT answered for `steamid` and IsAdmin/HasPermission/HasFlag are authoritative for it. False for a load that is still pending, for a failed load (the core retries it), for a steamid the current answer was not computed for (a reclaimed/reused slot, an unknown identity), for the console/out-of-range slots and while the core has no database. A false means 'ask again later' and MUST NOT be treated as 'this player is not an admin': after true, IsAdmin/HasPermission/HasFlag may still answer false (the player really is not an admin).",
+			"paramTypes": [
+				{
+					"name": "slot",
+					"type": "int32",
+					"ref": false,
+					"description": "Player slot (0..63)."
+				},
+				{
+					"name": "steamid",
+					"type": "uint64",
+					"ref": false,
+					"description": "SteamID64 of the client the caller is asking about (0 = unknown -> false)."
+				}
+			],
+			"retType": {
+				"type": "bool",
+				"description": "Whether the admin data for exactly this player is loaded and authoritative."
 			}
 		},
 		{

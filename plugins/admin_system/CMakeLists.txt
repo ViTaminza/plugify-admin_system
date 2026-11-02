@@ -6,10 +6,17 @@
 #                         compiled into the plugin like s2sdk_bindings / permissions_bindings
 #   plugify-admin_system  the plugin shared library (entry "bin/admin_system")
 #
+# The engine half is pure s2sdk + plgdb (docs/PLUGIN_STANDARD.md §7: no pisexcompat, no helper
+# library): admin_guards.cpp holds the plugin's own guards (map gate B1/B2, slot/controller checks
+# C2, owner identity, the Pisex printers), admin_menus.cpp the native s2sdk menu layer (C10/C13,
+# A7 teardown) and admin_config.hpp the engine-free file parsers. `hudmenu` stays an OPTIONAL
+# dependency: it is asked for the player's own "!menu" choice (hudmenu::GetClientMenuType) and the
+# menu type falls back to the HUD_LAYOUT table when it is not installed.
+#
 # The consumer side of the API (plugins/admin_system/include) is generated from
 # admin_system.pplugin by bin/plugify-gen; see API.md.
 
-set(ADMIN_SYSTEM_VERSION "1.0.3")
+set(ADMIN_SYSTEM_VERSION "1.2.0")
 
 # --- generated consumer bindings ----------------------------------------------
 # The .pplugin for the generator needs the version substituted at configure time.
@@ -64,29 +71,31 @@ if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/admin_core.cpp")
 endif()
 
 # --- plugin -------------------------------------------------------------------
-# Phase 2 (the s2sdk/pisexcompat glue) adds src/plugin.cpp; until then only admin_core and
-# the generated bindings are built. The plugin *implements* the API directly on admin_core and
-# never calls the generated binding slots (those belong to the consumer side, filled by the
-# plugify module inside each module plugin), so only the s2sdk bindings are linked in here.
+# The engine glue is pure s2sdk + plgdb: admin_guards.cpp (map gate, client checks, owner
+# identity, printers), admin_menus.cpp (native menu layer) and the three glue files. The plugin
+# *implements* the API directly on admin_core and never calls the generated binding slots (those
+# belong to the consumer side, filled by the plugify module inside each module plugin), so only the
+# s2sdk and hudmenu bindings are linked in here.
 if(TARGET admin_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin.cpp")
     add_library(plugify-admin_system SHARED
             src/plugin.cpp
             src/commands.cpp
             src/menus.cpp
+            src/admin_guards.cpp
+            src/admin_menus.cpp
             $<TARGET_OBJECTS:s2sdk_bindings>
+            $<TARGET_OBJECTS:hudmenu_bindings>
     )
     target_include_directories(plugify-admin_system PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
-    # SYSTEM: warnings from the generated s2sdk/plg/permissions/pisexcompat headers must not fail
-    # -Werror on our sources.
+    # SYSTEM: warnings from the generated s2sdk/plg/hudmenu headers must not fail -Werror on our
+    # sources.
     target_include_directories(plugify-admin_system SYSTEM PRIVATE
-            "${CMAKE_SOURCE_DIR}/sdk/include"
-            "${CMAKE_SOURCE_DIR}/libs/pisexcompat/include")
+            "${CMAKE_SOURCE_DIR}/sdk/include")
     # The generated consumer headers of our own plugin: only the callback typedefs of
     # admin_system/delegates.hpp are used (the binding slots stay null in the producer).
     target_include_directories(plugify-admin_system SYSTEM PRIVATE "${ADMIN_SYSTEM_INCLUDE_ROOT}")
     target_link_libraries(plugify-admin_system PRIVATE
             admin_core
-            pisexcompat
             -static-libstdc++ -static-libgcc
     )
     target_compile_options(plugify-admin_system PRIVATE -Wall -Wextra -Werror)
@@ -102,4 +111,114 @@ if(TARGET admin_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/src/plugin.cpp")
         target_link_options(plugify-admin_system PRIVATE
                 "-Wl,--version-script,${CMAKE_CURRENT_SOURCE_DIR}/sym/version_script.lds")
     endif()
+endif()
+
+# --- tests -------------------------------------------------------------------------------------
+# The plugin's own tests (run by ./test.sh, which executes every build/tests/*_tests):
+#
+#   admin_config_tests  the engine-free file half: the KV1 reader, core.ini/sorting.ini/
+#                       databases.cfg/admin_system.phrases.txt parsing, the pisexcompat candidate
+#                       order, the language chain and the CCommand-style command arguments.
+#   admin_menu_tests    the engine-free menu decisions: the exact ResolveS2sdkMenuTypeName table
+#                       (HUD_LAYOUT -> "hud" when registered, else "button"), the Pisex page-button
+#                       translation and the command-content rebuild (quoting round-trip).
+#
+# Neither links the plugin, the engine or any binding: they include the same headers the plugin
+# compiles, so a test cannot drift from the shipped code.
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/admin_config_tests.cpp")
+    add_executable(admin_config_tests tests/admin_config_tests.cpp)
+    target_include_directories(admin_config_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(admin_config_tests SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/sdk/include")
+    # admin_core supplies the Config getters (FlagName/PermissionsByFlag/IsDefaultPermission) the
+    # parser tests exercise; plgdb comes with it.
+    target_link_libraries(admin_config_tests PRIVATE admin_core plgdb -static-libstdc++ -static-libgcc)
+    target_compile_options(admin_config_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(admin_config_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    set_target_properties(admin_config_tests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/admin_runtime_tests.cpp")
+    # The real plugin translation units with every s2sdk/hudmenu binding null (the empty binding
+    # globals of s2sdk/s2sdk.cpp and hudmenu/hudmenu.cpp are linked in, not filled): the A1/A7
+    # fail-soft lifecycle - no client, menu, command, event or timer call may happen and
+    # OnPluginStart must still answer Ok.
+    add_executable(admin_runtime_tests
+            tests/admin_runtime_tests.cpp
+            src/plugin.cpp
+            src/commands.cpp
+            src/menus.cpp
+            src/admin_guards.cpp
+            src/admin_menus.cpp
+            $<TARGET_OBJECTS:s2sdk_bindings>
+            $<TARGET_OBJECTS:hudmenu_bindings>)
+    target_include_directories(admin_runtime_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(admin_runtime_tests SYSTEM PRIVATE
+            "${CMAKE_SOURCE_DIR}/sdk/include"
+            "${ADMIN_SYSTEM_INCLUDE_ROOT}")
+    target_link_libraries(admin_runtime_tests PRIVATE admin_core -static-libstdc++ -static-libgcc)
+    target_compile_options(admin_runtime_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(admin_runtime_tests PRIVATE
+            _GLIBCXX_USE_CXX11_ABI=1
+            PLUGIFY_MODULE="admin_system"
+            PLUGIFY_IS_DEBUG=0
+            PLUGIFY_IS_RELEASE=1)
+    set_target_properties(admin_runtime_tests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/admin_gate_tests.cpp")
+    # The s2sdk guards (src/admin_guards.cpp) against recording fakes: the map gate latch (B1),
+    # the signed entity handles (C1), the slot/controller chain (C2), the owner identity, and the
+    # server-console rule of PrintConsole (C11).
+    add_executable(admin_gate_tests
+            tests/admin_gate_tests.cpp
+            src/admin_guards.cpp
+            $<TARGET_OBJECTS:s2sdk_bindings>)
+    target_include_directories(admin_gate_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(admin_gate_tests SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/sdk/include")
+    target_link_libraries(admin_gate_tests PRIVATE -static-libstdc++ -static-libgcc)
+    target_compile_options(admin_gate_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(admin_gate_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    set_target_properties(admin_gate_tests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/admin_commands_tests.cpp")
+    # The real plugin translation units against recording fakes with a live SQLite database: the
+    # strict caller validation (C11), the admin-data readiness gate of the permission check and the
+    # owner-verified deferred replies of the offline punishment / group inserts.
+    add_executable(admin_commands_tests
+            tests/admin_commands_tests.cpp
+            src/plugin.cpp
+            src/commands.cpp
+            src/menus.cpp
+            src/admin_guards.cpp
+            src/admin_menus.cpp
+            $<TARGET_OBJECTS:s2sdk_bindings>
+            $<TARGET_OBJECTS:hudmenu_bindings>)
+    target_include_directories(admin_commands_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(admin_commands_tests SYSTEM PRIVATE
+            "${CMAKE_SOURCE_DIR}/sdk/include"
+            "${ADMIN_SYSTEM_INCLUDE_ROOT}")
+    target_link_libraries(admin_commands_tests PRIVATE admin_core -static-libstdc++ -static-libgcc)
+    target_compile_options(admin_commands_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(admin_commands_tests PRIVATE
+            _GLIBCXX_USE_CXX11_ABI=1
+            PLUGIFY_MODULE="admin_system"
+            PLUGIFY_IS_DEBUG=0
+            PLUGIFY_IS_RELEASE=1)
+    set_target_properties(admin_commands_tests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+endif()
+
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/admin_menu_tests.cpp")
+    add_executable(admin_menu_tests tests/admin_menu_tests.cpp)
+    target_include_directories(admin_menu_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_include_directories(admin_menu_tests SYSTEM PRIVATE "${CMAKE_SOURCE_DIR}/sdk/include")
+    target_link_libraries(admin_menu_tests PRIVATE -static-libstdc++ -static-libgcc)
+    target_compile_options(admin_menu_tests PRIVATE -Wall -Wextra -Werror)
+    target_compile_definitions(admin_menu_tests PRIVATE _GLIBCXX_USE_CXX11_ABI=1)
+    set_target_properties(admin_menu_tests PROPERTIES
+            RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
 endif()

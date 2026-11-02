@@ -24,7 +24,9 @@
 //     which plgdb only runs inside Poll() on the game thread; the only blocking statement is
 //     CreateSchema(), which the plugin calls once at startup.
 
+#include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -57,6 +59,137 @@ inline constexpr int64_t kPermanent = 0;
 inline constexpr std::string_view kDefaultPrefix = "as_";
 inline constexpr std::string_view kConsoleSteamId = "0";
 
+// --- per-slot admin load state ------------------------------------------------------
+// The admin record of a player is read asynchronously, and "not loaded yet" is indistinguishable
+// from "not an admin" through IsAdmin()/HasPermission(): both answer false. The state below is the
+// missing completion signal (see LoadSnapshot()/IsAdminDataReady()):
+//   * Unknown - no load was requested for the current slot generation (plugin start, ResetSlot,
+//     a slot that was reclaimed, or a destroyed/not-ready core);
+//   * Pending - the SELECT was queued and has not answered yet;
+//   * Ready   - the last SELECT answered: the in-memory record is authoritative for load_steamid,
+//     including the "no rows" answer (a definitive "this player is not an admin");
+//   * Failed  - the SELECT failed (a plgdb error); the record is NOT authoritative and a retry is
+//     expected. Like every other admin_core statement its effects only appear from Poll().
+enum class AdminLoadState : int32_t {
+	Unknown = 0,
+	Pending = 1,
+	Ready = 2,
+	Failed = 3,
+};
+
+// One atomic view of a slot's load state. generation changes whenever the slot is reset/reused
+// (ResetSlot), request is the id of the newest LoadAdmin() call: a consumer that saw an older pair
+// (or a different steamid) must re-read instead of trusting the previous answer.
+struct AdminLoadSnapshot {
+	AdminLoadState state = AdminLoadState::Unknown;
+	uint64_t steamid = 0;    // the steamid the state was requested for
+	uint64_t generation = 0; // the slot generation the request belongs to
+	uint64_t request = 0;    // the newest LoadAdmin() request id
+
+	// True only when the answer is authoritative for the loaded steamid. It says nothing about
+	// whether that player is an admin - IsAdmin()/HasPermission() answer that afterwards.
+	bool IsAuthoritative() const { return state == AdminLoadState::Ready; }
+};
+
+// --- the retry policy of the plugin's 1 Hz reconcile -------------------------------
+// The admin and punishment loads are queued from several places: the connect path, the reconcile
+// loop and the reload/admin/punish commands plus AddAdmin(), which call LoadAdmin() /
+// ReloadPunishments() directly. The reconcile must not duplicate a statement that is already in
+// flight (that would supersede it by request id and throw the answer away), and it must retry a
+// statement that never answered with a backoff. The decision and its bookkeeping are engine-free
+// so the reconcile behaviour is unit-tested without a plugin.
+inline constexpr std::chrono::seconds kLoadRetryInitial{10}; // first retry window
+inline constexpr std::chrono::seconds kLoadRetryMax{60};     // backoff cap
+// While the plgdb worker already has more than this many statements queued (a database outage
+// makes each one sit in the connect timeout), nothing is queued or armed: the backlog must not
+// grow.
+inline constexpr std::size_t kMaxPendingLoads = 64;
+
+struct SlotRetryPolicy {
+	std::chrono::seconds initial = kLoadRetryInitial;
+	std::chrono::seconds maximum = kLoadRetryMax;
+	std::size_t maxPendingQueue = kMaxPendingLoads;
+};
+
+enum class SlotRetryAction : int32_t {
+	Settled = 0,             // both statements answered: reset retryDelay/retryAt
+	Wait = 1,                // nothing to do now
+	ArmDeadline = 2,         // a load is already in flight and nothing is armed: arm, queue nothing
+	ReloadPunishments = 3,   // the punishment SELECT timed out
+	ReloadAdmin = 4,         // the admin SELECT timed out
+	ReloadBoth = 5,          // both timed out
+};
+
+struct SlotRetryDecision {
+	SlotRetryAction action = SlotRetryAction::Wait;
+	// ArmDeadline: the window to arm. Reload*: the next backoff step to store and arm.
+	std::chrono::seconds delay{0};
+};
+
+// Decide what the reconcile has to do for one tracked slot. |punishmentsLoaded| is the plugin's
+// completion bit for the punishment load, |admin| the core's snapshot for the same slot,
+// |steamid| the steamid the slot currently belongs to, |retryAt|/|currentDelay| the plugin's
+// backoff bookkeeping (an unset retryAt is the epoch). Two facts keep a Pending statement safe:
+//   * a request that is in flight from *outside* the reconcile (a reload command, AddAdmin) leaves
+//     retryAt unset, so it only gets ArmDeadline - one full window, no duplicate SELECT;
+//   * a statement that is still unanswered when its window expires is retried with the backoff,
+//     and only if it is still missing (punishments are never replayed while punishmentsLoaded).
+// The accepted residual risk: a punishment SELECT that is genuinely still queued when its window
+// expires is re-queued by the retry (that is how a statement stuck behind a connect timeout is
+// recovered). It re-applies the same rows, and for a ban row it can fire the ban/kick callback a
+// second time; the reconcile only ever re-queues the punishment query when punishmentsLoaded is
+// false, so this cannot happen for a slot whose punishment answer already arrived.
+inline SlotRetryDecision DecideSlotRetry(bool punishmentsLoaded, const AdminLoadSnapshot& admin, uint64_t steamid,
+										 std::chrono::steady_clock::time_point now,
+										 std::chrono::steady_clock::time_point retryAt,
+										 std::chrono::seconds currentDelay, std::size_t pendingQueue,
+										 const SlotRetryPolicy& policy = {}) {
+	const bool adminSettled = admin.state == AdminLoadState::Ready && admin.steamid == steamid;
+	if (punishmentsLoaded && adminSettled) {
+		return {SlotRetryAction::Settled, std::chrono::seconds(0)};
+	}
+	if (pendingQueue > policy.maxPendingQueue) {
+		return {}; // the worker is saturated: neither queue nor arm anything
+	}
+	if (retryAt == std::chrono::steady_clock::time_point{}) {
+		// Nothing is armed: a statement is probably in flight from outside this loop. Give it one
+		// full window; only a load that is still unanswered when it expires is retried.
+		return {SlotRetryAction::ArmDeadline, policy.initial};
+	}
+	if (now < retryAt) {
+		return {};
+	}
+	const std::chrono::seconds next =
+		currentDelay == std::chrono::seconds(0) ? policy.initial : std::min(currentDelay * 2, policy.maximum);
+	SlotRetryDecision decision;
+	decision.delay = next;
+	decision.action = (!punishmentsLoaded && !adminSettled)
+						  ? SlotRetryAction::ReloadBoth
+						  : (!punishmentsLoaded ? SlotRetryAction::ReloadPunishments : SlotRetryAction::ReloadAdmin);
+	return decision;
+}
+
+// Applies a decision to the plugin's two bookkeeping values. Shared by the reconcile loop and the
+// tests, so a test cannot drift from the code it is supposed to cover.
+inline void ApplySlotRetryDecision(const SlotRetryDecision& decision, std::chrono::steady_clock::time_point now,
+								   std::chrono::steady_clock::time_point& retryAt, std::chrono::seconds& retryDelay) {
+	switch (decision.action) {
+	case SlotRetryAction::Settled:
+		retryDelay = std::chrono::seconds(0);
+		retryAt = {};
+		break;
+	case SlotRetryAction::Wait:
+		break;
+	case SlotRetryAction::ArmDeadline:
+		retryAt = now + decision.delay;
+		break;
+	default:
+		retryDelay = decision.delay;
+		retryAt = now + decision.delay;
+		break;
+	}
+}
+
 // --- config ---------------------------------------------------------------------
 // One flag of the "flags" block of core.ini.
 struct Flag {
@@ -70,9 +203,9 @@ struct ReasonTimes {
 	std::vector<std::pair<int, std::string>> times; // seconds -> label ('0' = forever)
 };
 
-// The core.ini model. The defaults are the values of the shipped config file; the file itself
-// is parsed by the plugin with the pisexcompat KV parser, which fills a Config and hands it to
-// SetConfig().
+// The core.ini model. The defaults are the values of the shipped config file; the file itself is
+// parsed by the plugin with its own KV1 reader (src/kv1.hpp + src/admin_config.hpp, engine-free),
+// which fills a Config and hands it to SetConfig().
 struct Config {
 	std::string database_prefix = std::string(kDefaultPrefix);
 	int admin_server_id = -1;
@@ -247,6 +380,17 @@ public:
 	bool HasFlag(int slot, std::string_view flag) const;
 	bool IsAdmin(int slot) const;
 
+	// --- admin load readiness ------------------------------------------------------------
+	// The state of the asynchronous admin load of a slot; Unknown outside [0, kMaxPlayers).
+	AdminLoadSnapshot LoadSnapshot(int slot) const;
+	// The completion check a consumer needs, atomically: a slot in range whose admin SELECT
+	// answered for exactly this steamid. False for Unknown/Pending/Failed, for a steamid the
+	// current answer was not computed for (a reclaimed slot, another player), for the console and
+	// out-of-range slots, and for steamid 0 (identity unknown). A Ready answer for a steamid that
+	// has no admin row is still "ready": it is the definitive "not an admin", so a consumer must
+	// call IsAdmin()/HasPermission() afterwards - it must never treat a false as "not an admin".
+	bool IsAdminDataReady(int slot, uint64_t steamid) const;
+
 	// AddPlayerLocalFlag/Permission/Immunity of the original. They change the in-memory record
 	// only; note that the flag list and the permission list are independent, exactly as in the
 	// original (adding a flag does not expand it into permissions).
@@ -260,10 +404,13 @@ public:
 	// --- asynchronous loads -----------------------------------------------------------
 	// CheckPermissions(): reads admins + admins_servers + groups for one steamid and applies the
 	// result in Poll(); onAdminLoaded fires only when a row was found (OnAdminConnectedSend).
-	// A load in flight when the slot is reset is discarded.
+	// The slot's load state goes Pending -> Ready (a row or no row) or Pending -> Failed; a load
+	// in flight when the slot is reset (or superseded by a newer LoadAdmin of the same slot) is
+	// discarded by its generation/request pair.
 	void LoadAdmin(int slot, uint64_t steamid, std::string player_name);
 	// Clears the admin record and the punishments of a slot (RunPunishments/ResetPunishments +
-	// the flag wipe of OnClientDisconnect) and invalidates loads in flight.
+	// the flag wipe of OnClientDisconnect) and invalidates loads in flight; the load state goes
+	// back to Unknown for the new slot generation.
 	void ResetSlot(int slot);
 
 	// CheckPunishments(): the punishments of a player that just connected. A ban only sets
@@ -295,20 +442,25 @@ public:
 	// caller disconnects after ban_delay.
 	bool Punish(const PlayerIdentity& player, int type, int time, std::string reason, int admin_slot);
 	// AddOfflinePlayerPunishment(): the same, without an ip column and without a slot.
-	void PunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot);
+	// |onComplete| (optional) is told whether the INSERT was stored: false for a veto, a
+	// rejected value or a database error; it runs from Poll() for the stored case.
+	void PunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot,
+					   std::function<void(bool)> onComplete = {});
 	// TryAddPunishment(): the immunity rules of immunity_type in front of Punish(). Returns
 	// false when the target is immune.
 	bool TryPunish(const PlayerIdentity& player, int type, int time, std::string reason, int admin_slot);
 	// TryAddOfflinePunishment(): the same for a player that is not connected - the target's
-	// immunity is read from the database first.
-	void TryPunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot);
+	// immunity is read from the database first. |onComplete| sees the result of the INSERT.
+	void TryPunishOffline(std::string steamid64, std::string name, int type, int time, std::string reason, int admin_slot,
+						  std::function<void(bool)> onComplete = {});
 	// The immunity rules alone (immunity_type 0..3 of core.ini). |admin_immunity| is the immunity
 	// of the caller, |target_immunity| the one of the target; slot -1 (console) always passes.
 	static bool CanPunish(int admin_slot, int admin_immunity, int target_immunity, int immunity_type);
 
 	// RemovePlayerPunishment(): the unpunish_type rule in front of Unpunish().
 	bool TryUnpunish(int slot, int type, int admin_slot);
-	// The UPDATE itself (unpunish_admin_id) plus the in-memory clear and the notification.
+	// The UPDATE itself (unpunish_admin_id), the in-memory clear and - from the UPDATE callback,
+	// only when it actually lifted a row - the notification.
 	void Unpunish(int slot, int type, int admin_slot);
 	// RemoveOfflinePlayerPunishment().
 	void UnpunishOffline(std::string steamid64, int type, int admin_slot);
@@ -330,8 +482,15 @@ public:
 	void RemoveGroup(std::string identifier);
 
 	// --- hooks (called on the game thread, from Poll() or from the public methods) --------
-	// A successful admin load (OnAdminConnectedSend of the original).
+	// A successful admin load (OnAdminConnectedSend of the original). It runs after the record has
+	// been applied and the slot's load state is Ready, so a listener may query the record, the
+	// load state or call IsAdmin()/HasPermission() from inside it.
 	std::function<void(int slot, const AdminRecord& admin)> onAdminLoaded;
+	// Called with the parsed rows of a non-empty admin SELECT, after parsing and before the record
+	// is built/applied. It is a seam for the exception path of LoadAdmin: a throw from here is
+	// handled exactly like a parse failure (the slot goes Failed, never Ready with a cleared
+	// record), which the tests use to drive that path without a real allocation failure.
+	std::function<void(const std::vector<AdminRow>& rows)> onAdminRowsParsed;
 	// The punishments of a slot were (re)loaded; |ban| asks for a disconnect (immediately for a
 	// connect, after ban_delay when |forced|).
 	std::function<void(int slot, PunishmentLoadOutcome outcome)> onPunishmentsLoaded;
@@ -360,7 +519,10 @@ public:
 
 private:
 	struct SlotState {
-		uint64_t generation = 1;
+		uint64_t generation = 1;          // bumped by ResetSlot(): the slot changed hands
+		AdminLoadState load = AdminLoadState::Unknown;
+		uint64_t load_steamid = 0;        // the steamid the current state belongs to
+		uint64_t request = 0;             // id of the newest LoadAdmin() (stale answers are dropped)
 	};
 
 	void ReportError(std::string_view message) const;

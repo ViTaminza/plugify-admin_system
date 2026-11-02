@@ -7,10 +7,15 @@
 //                      original: select a punishment type, a player (or an offline steamid), a
 //                      reason (or a typed one) and a time, then apply it
 //
-// The registry lives here (the mCategories/mItems maps of the original), the menu plumbing comes
-// from libs/pisexcompat. Menu callbacks run under s2sdk's menu lock, so nothing inside them calls
-// the menu subsystem: pisexcompat queues DisplayPlayerMenu/ClosePlayerMenu from a callback and
-// applies them in the next Poll().
+// The registry lives here (the mCategories/mItems maps of the original); the menu plumbing is the
+// plugin's native s2sdk menu layer (admin_menus.cpp). Nothing below creates, displays or destroys a
+// menu directly: DisplayMenu()/CloseMenu() queue the request and OnPluginUpdate applies it with a
+// re-validated owner (SteamID64 + controller handle) and the core's authoritative admin data. A
+// selection callback therefore runs outside s2sdk's menu manager lock and may safely open the next
+// menu, print, query the database or close the display.
+//
+// The item numbering and the callback contract are the Pisex ones: 1..5 select a visible item,
+// 7 is the exit-back button and 9 the exit button (the original ignored 9).
 
 #include <algorithm>
 #include <cstdint>
@@ -22,8 +27,8 @@
 #include <utility>
 #include <vector>
 
-#include <pisex/pisex.hpp>
-
+#include "admin_guards.hpp"
+#include "admin_menus.hpp"
 #include "admin_plugin.hpp"
 
 namespace admin_system {
@@ -37,8 +42,26 @@ constexpr const char* kPermissions[kPunishTypeCount] = {"@admin/ban", "@admin/mu
 constexpr const char* kUnpunishPermissions[kPunishTypeCount] = {"@admin/unban", "@admin/unmute", "@admin/ungag",
 																"@admin/unsilence"};
 
-// The menu item numbers pisexcompat reports: 1..5 select an entry, 7 = exit-back, 9 = exit.
+// The menu item numbers the Pisex menu reports: 1..5 select an entry, 7 = exit-back, 9 = exit.
 inline constexpr int kMenuSelectMax = 7;
+
+// The slot that currently holds |steamid|, or -1 when the player left (or the slot was reused
+// while the menu was open). A menu lives up to a minute, so a captured slot number alone is not
+// an identity: the menus carry the SteamID64 and resolve it again when the selection arrives.
+int32_t LiveSlotOfSteamId(uint64_t steamid) {
+	if (steamid == 0) {
+		return -1;
+	}
+	for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
+		if (!HasClient(slot) || IsFakeClientSlot(slot)) {
+			continue;
+		}
+		if (ClientSteamID64(slot) == steamid) {
+			return slot;
+		}
+	}
+	return -1;
+}
 
 } // namespace
 
@@ -106,8 +129,8 @@ void AdminPlugin::ShowAdminMenu(int32_t slot) {
 	if (slot < 0 || slot >= kMaxSlots || CoreOrNull() == nullptr || !IsAdminSlot(slot)) {
 		return;
 	}
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase("MainTitle"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase("MainTitle"));
 
 	// The categories of sorting.ini first, then the rest in registry order.
 	const auto addCategory = [&](const std::string& key) {
@@ -118,7 +141,7 @@ void AdminPlugin::ShowAdminMenu(int32_t slot) {
 		if (!HasAccessInCategory(slot, key)) {
 			return;
 		}
-		pisex::g_pMenus->AddItemMenu(menu, key.c_str(), CategoryLabel(slot, it->second).c_str());
+		AddMenuItem(menu, key, CategoryLabel(slot, it->second));
 	};
 	for (const std::string& key : m_sortCategories) {
 		addCategory(key);
@@ -129,9 +152,9 @@ void AdminPlugin::ShowAdminMenu(int32_t slot) {
 		}
 	}
 
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, false);
-	pisex::g_pMenus->SetCallback(menu, [](const char* back, const char*, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, false);
+	SetMenuCallback(menu, [](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item < kMenuSelectMax && back != nullptr) {
 				g_adminPlugin.SetLastCategory(playerSlot, back);
@@ -143,7 +166,7 @@ void AdminPlugin::ShowAdminMenu(int32_t slot) {
 			LogError("admin_system: unknown exception in the admin menu callback");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowAdminCategoryMenu(int32_t slot, const std::string& category) {
@@ -154,8 +177,8 @@ void AdminPlugin::ShowAdminCategoryMenu(int32_t slot, const std::string& categor
 	if (categoryIt == m_categories.end()) {
 		return;
 	}
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase(categoryIt->second.name.c_str()));
+	Menu menu;
+	SetMenuTitle(menu, Phrase(categoryIt->second.name.c_str()));
 
 	const auto addItem = [&](const std::string& identity) {
 		const auto itemIt = categoryIt->second.items.find(identity);
@@ -167,7 +190,7 @@ void AdminPlugin::ShowAdminCategoryMenu(int32_t slot, const std::string& categor
 		if (item.identity.empty() || item.category.empty() || !HasAccessInItem(slot, category, identity)) {
 			return;
 		}
-		pisex::g_pMenus->AddItemMenu(menu, identity.c_str(), ItemLabel(slot, item).c_str());
+		AddMenuItem(menu, identity, ItemLabel(slot, item));
 	};
 	if (const auto sortIt = m_sortItems.find(category); sortIt != m_sortItems.end()) {
 		for (const std::string& identity : sortIt->second) {
@@ -183,9 +206,9 @@ void AdminPlugin::ShowAdminCategoryMenu(int32_t slot, const std::string& categor
 		addItem(identity);
 	}
 
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [category](const char* back, const char*, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [category](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item < kMenuSelectMax && back != nullptr) {
 				g_adminPlugin.ShowAdminItemMenu(playerSlot, category, back);
@@ -198,7 +221,7 @@ void AdminPlugin::ShowAdminCategoryMenu(int32_t slot, const std::string& categor
 			LogError("admin_system: unknown exception in the category menu callback");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowAdminLastCategoryMenu(int32_t slot) {
@@ -224,7 +247,7 @@ void AdminPlugin::ShowAdminItemMenu(int32_t slot, const std::string& category, c
 }
 
 void AdminPlugin::CloseAdminMenu(int32_t slot) const {
-	pisex::g_pMenus->ClosePlayerMenu(slot);
+	CloseMenu(slot);
 }
 
 // --- the punishment flows (ShowPunishMenu / ShowUnPunishMenu / ... of the original) -----------
@@ -233,8 +256,8 @@ void AdminPlugin::ShowPunishTypeMenu(int32_t slot, bool offline, bool unpunish) 
 	if (slot < 0 || slot >= kMaxSlots) {
 		return;
 	}
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase(unpunish ? "SelectUnPunishType" : "SelectPunishType"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase(unpunish ? "SelectUnPunishType" : "SelectPunishType"));
 	const char* const* phrases = unpunish ? kUnpunishPhrases : kTypePhrases;
 	const char* const* permissions = unpunish ? kUnpunishPermissions : kPermissions;
 	for (int type = 0; type < kPunishTypeCount; ++type) {
@@ -242,11 +265,11 @@ void AdminPlugin::ShowPunishTypeMenu(int32_t slot, bool offline, bool unpunish) 
 		if (core == nullptr || !core->HasPermission(slot, permissions[type])) {
 			continue;
 		}
-		pisex::g_pMenus->AddItemMenu(menu, std::to_string(type).c_str(), Phrase(phrases[type]));
+		AddMenuItem(menu, std::to_string(type), Phrase(phrases[type]));
 	}
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [offline, unpunish](const char* back, const char*, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [offline, unpunish](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item < kMenuSelectMax && back != nullptr) {
 				const int type = std::atoi(back);
@@ -270,7 +293,7 @@ void AdminPlugin::ShowPunishTypeMenu(int32_t slot, bool offline, bool unpunish) 
 			LogError("admin_system: unknown exception in the punishment type menu");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowPunishMenu(int32_t slot, int32_t type) {
@@ -284,14 +307,15 @@ void AdminPlugin::ShowPunishMenu(int32_t slot, int32_t type) {
 		return;
 	}
 	const int immunity = core->FindAdmin(slot) == nullptr ? 0 : core->FindAdmin(slot)->immunity;
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase("SelectPlayer"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase("SelectPlayer"));
 	bool found = false;
 	for (int32_t target = 0; target < kMaxSlots; ++target) {
-		if (!pisex::g_pPlayers->IsConnected(target) || pisex::g_pPlayers->GetSteamID64(target) == 0) {
+		const uint64_t targetSteamId = ClientSteamID64(target);
+		if (!HasClient(target) || targetSteamId == 0) {
 			continue;
 		}
-		if (pisex::GetPawnEntity(target) == 0) {
+		if (!HasPawn(target)) {
 			continue; // PARITY: the original skipped a slot whose pawn handle is null (GetPlayerPawn())
 		}
 		if (core->IsPunished(target, type)) {
@@ -317,18 +341,24 @@ void AdminPlugin::ShowPunishMenu(int32_t slot, int32_t type) {
 		default:
 			break;
 		}
-		pisex::g_pMenus->AddItemMenu(menu, std::to_string(target).c_str(), pisex::g_pPlayers->GetPlayerName(target));
+		AddMenuItem(menu, std::to_string(targetSteamId), ClientName(target));
 		found = true;
 	}
 	if (!found) {
-		pisex::g_pMenus->AddItemMenu(menu, "0", Phrase("NoPlayers"), pisex::ITEM_DISABLED);
+		AddMenuItem(menu, "0", Phrase("NoPlayers"), /*disabled=*/true);
 	}
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [type](const char* back, const char*, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [type](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item < kMenuSelectMax && back != nullptr) {
-				g_adminPlugin.ShowReasonsMenu(playerSlot, static_cast<uint64_t>(std::atoi(back)), type, false);
+				uint64_t target = 0;
+				try {
+					target = std::stoull(back);
+				} catch (const std::exception&) {
+					return;
+				}
+				g_adminPlugin.ShowReasonsMenu(playerSlot, target, type, false);
 			} else if (item == kMenuSelectMax) {
 				g_adminPlugin.ShowPunishTypeMenu(playerSlot, false, false);
 			}
@@ -336,37 +366,37 @@ void AdminPlugin::ShowPunishMenu(int32_t slot, int32_t type) {
 			LogError("admin_system: unknown exception in the punish menu");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowReasonsMenu(int32_t slot, uint64_t target, int32_t type, bool offline) {
 	if (slot < 0 || slot >= kMaxSlots || type < 0 || type >= kPunishTypeCount) {
 		return;
 	}
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase("SelectReason"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase("SelectReason"));
 	const bool ownReasons = Cfg().own_reason && CoreOrNull() != nullptr && Core().HasPermission(slot, "@admin/own_reason");
 	if (Cfg().time_reason_type != 0) {
 		for (const ReasonTimes& reason : Cfg().reasons_times[static_cast<size_t>(type)]) {
 			if (reason.reason == "own") {
 				if (ownReasons) {
-					pisex::g_pMenus->AddItemMenu(menu, "own", Phrase("Item_OwnReason"));
+					AddMenuItem(menu, "own", Phrase("Item_OwnReason"));
 				}
 			} else {
-				pisex::g_pMenus->AddItemMenu(menu, reason.reason.c_str(), reason.reason.c_str());
+				AddMenuItem(menu, reason.reason, reason.reason);
 			}
 		}
 	} else {
 		if (ownReasons) {
-			pisex::g_pMenus->AddItemMenu(menu, "own", Phrase("Item_OwnReason"));
+			AddMenuItem(menu, "own", Phrase("Item_OwnReason"));
 		}
 		for (const std::string& reason : Cfg().reasons[static_cast<size_t>(type)]) {
-			pisex::g_pMenus->AddItemMenu(menu, reason.c_str(), reason.c_str());
+			AddMenuItem(menu, reason, reason);
 		}
 	}
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [type, target, offline](const char* back, const char*, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [type, target, offline](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item >= kMenuSelectMax) {
 				if (item == kMenuSelectMax) {
@@ -385,7 +415,7 @@ void AdminPlugin::ShowReasonsMenu(int32_t slot, uint64_t target, int32_t type, b
 				own.type = type;
 				own.offline = offline;
 				g_adminPlugin.CloseAdminMenu(playerSlot);
-				pisex::g_pUtils->PrintToChat(playerSlot, g_adminPlugin.Phrase("EnterOwnReason"));
+				PrintChat(playerSlot, "%s", g_adminPlugin.Phrase("EnterOwnReason"));
 				return;
 			}
 			g_adminPlugin.ShowTimesMenuFor(playerSlot, target, type, back, offline, "");
@@ -395,7 +425,7 @@ void AdminPlugin::ShowReasonsMenu(int32_t slot, uint64_t target, int32_t type, b
 			LogError("admin_system: unknown exception in the reason menu");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowTimesMenuFor(int32_t slot, uint64_t target, int32_t type, const std::string& reason, bool offline,
@@ -403,8 +433,8 @@ void AdminPlugin::ShowTimesMenuFor(int32_t slot, uint64_t target, int32_t type, 
 	if (slot < 0 || slot >= kMaxSlots || type < 0 || type >= kPunishTypeCount) {
 		return;
 	}
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase("SelectTime"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase("SelectTime"));
 	const std::string resolved = reason == "own" && !ownReason.empty() ? ownReason : reason;
 	int count = 0;
 	if (Cfg().time_reason_type != 0) {
@@ -413,24 +443,23 @@ void AdminPlugin::ShowTimesMenuFor(int32_t slot, uint64_t target, int32_t type, 
 				continue;
 			}
 			for (const auto& [seconds, label] : entry.times) {
-				pisex::g_pMenus->AddItemMenu(menu, std::to_string(seconds).c_str(), label.c_str());
+				AddMenuItem(menu, std::to_string(seconds), label);
 				++count;
 			}
 			break;
 		}
 	} else {
 		for (const auto& [seconds, label] : Cfg().times[static_cast<size_t>(type)]) {
-			pisex::g_pMenus->AddItemMenu(menu, std::to_string(seconds).c_str(), label.c_str());
+			AddMenuItem(menu, std::to_string(seconds), label);
 			++count;
 		}
 	}
 	if (count == 0) {
-		pisex::g_pMenus->AddItemMenu(menu, "0", Phrase("NoTimes"), pisex::ITEM_DISABLED);
+		AddMenuItem(menu, "0", Phrase("NoTimes"), /*disabled=*/true);
 	}
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [type, target, resolved, offline](const char* back, const char*, int item,
-																		int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [type, target, resolved, offline](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item >= kMenuSelectMax) {
 				if (item == kMenuSelectMax) {
@@ -447,7 +476,15 @@ void AdminPlugin::ShowTimesMenuFor(int32_t slot, uint64_t target, int32_t type, 
 				const std::string name = g_adminPlugin.MarkOfflinePunished(target, type, playerSlot);
 				g_adminPlugin.AddOfflinePlayerPunishment(std::to_string(target), name, type, seconds, resolved, playerSlot);
 			} else {
-				g_adminPlugin.AddPlayerPunishment(g_adminPlugin.IdentityOf(static_cast<int32_t>(target)), type, seconds,
+				// |target| is the SteamID64 captured when the player list was built (menus live
+				// up to a minute): the slot it came from may belong to someone else by now.
+				const int32_t targetSlot = LiveSlotOfSteamId(target);
+				if (targetSlot < 0) {
+					PrintChat(playerSlot, "%s", g_adminPlugin.Phrase("PlayerNotFound"));
+					g_adminPlugin.CloseAdminMenu(playerSlot);
+					return;
+				}
+				g_adminPlugin.AddPlayerPunishment(g_adminPlugin.IdentityOf(targetSlot), type, seconds,
 												  resolved, playerSlot, true, true);
 			}
 			g_adminPlugin.CloseAdminMenu(playerSlot);
@@ -457,7 +494,7 @@ void AdminPlugin::ShowTimesMenuFor(int32_t slot, uint64_t target, int32_t type, 
 			LogError("admin_system: unknown exception in the time menu");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowUnpunishMenu(int32_t slot, int32_t type) {
@@ -469,11 +506,12 @@ void AdminPlugin::ShowUnpunishMenu(int32_t slot, int32_t type) {
 	// has '@admin/unpunish_all'.
 	const bool unpunishAll = core->HasPermission(slot, "@admin/unpunish_all");
 	const uint64_t ownSteamId = SlotSteamId(slot);
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase("SelectPlayer"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase("SelectPlayer"));
 	bool found = false;
 	for (int32_t target = 0; target < kMaxSlots; ++target) {
-		if (!pisex::g_pPlayers->IsConnected(target) || pisex::g_pPlayers->GetSteamID64(target) == 0) {
+		const uint64_t targetSteamId = ClientSteamID64(target);
+		if (!HasClient(target) || targetSteamId == 0) {
 			continue;
 		}
 		if (!core->IsPunished(target, type)) {
@@ -482,20 +520,33 @@ void AdminPlugin::ShowUnpunishMenu(int32_t slot, int32_t type) {
 		if (Cfg().unpunish_type == 0 && !unpunishAll && core->PunishmentAdminSteamId(target, type) != ownSteamId) {
 			continue;
 		}
-		pisex::g_pMenus->AddItemMenu(menu, std::to_string(target).c_str(), pisex::g_pPlayers->GetPlayerName(target));
+		AddMenuItem(menu, std::to_string(targetSteamId), ClientName(target));
 		found = true;
 	}
 	if (!found) {
-		pisex::g_pMenus->AddItemMenu(menu, "0", Phrase("NoPlayers"), pisex::ITEM_DISABLED);
+		AddMenuItem(menu, "0", Phrase("NoPlayers"), /*disabled=*/true);
 	}
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [type](const char* back, const char* front, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [type](const char* back, const char* front, int item, int playerSlot) {
 		try {
 			if (item < kMenuSelectMax && back != nullptr) {
-				g_adminPlugin.RemovePlayerPunishment(std::atoi(back), type, playerSlot, true);
-				pisex::g_pUtils->PrintToChat(playerSlot, g_adminPlugin.Phrase("UnPunishSuccess"),
-											 front != nullptr ? front : "");
+				uint64_t target = 0;
+				try {
+					target = std::stoull(back);
+				} catch (const std::exception&) {
+					return;
+				}
+				// The list carries the SteamID64: lift the punishment only from the player it
+				// was built for, never from whoever occupies the slot now.
+				const int32_t targetSlot = LiveSlotOfSteamId(target);
+				if (targetSlot < 0) {
+					PrintChat(playerSlot, "%s", g_adminPlugin.Phrase("PlayerNotFound"));
+					g_adminPlugin.CloseAdminMenu(playerSlot);
+					return;
+				}
+				g_adminPlugin.RemovePlayerPunishment(targetSlot, type, playerSlot, true);
+				PrintChat(playerSlot, g_adminPlugin.Phrase("UnPunishSuccess"), front != nullptr ? front : "");
 				g_adminPlugin.CloseAdminMenu(playerSlot);
 			} else if (item == kMenuSelectMax) {
 				g_adminPlugin.ShowPunishTypeMenu(playerSlot, false, true);
@@ -506,29 +557,29 @@ void AdminPlugin::ShowUnpunishMenu(int32_t slot, int32_t type) {
 			LogError("admin_system: unknown exception in the unpunish menu");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowPunishOfflineMenu(int32_t slot, int32_t type) {
 	if (slot < 0 || slot >= kMaxSlots || type < 0 || type >= kPunishTypeCount) {
 		return;
 	}
-	pisex::Menu menu;
-	pisex::g_pMenus->SetTitleMenu(menu, Phrase("SelectOfflinePlayer"));
+	Menu menu;
+	SetMenuTitle(menu, Phrase("SelectOfflinePlayer"));
 	bool found = false;
 	for (const OfflineUser& user : m_offlineUsers) {
 		if (user.punished[static_cast<size_t>(type)] || user.admin[static_cast<size_t>(type)] != 0) {
 			continue;
 		}
-		pisex::g_pMenus->AddItemMenu(menu, std::to_string(user.steamid).c_str(), user.name.c_str());
+		AddMenuItem(menu, std::to_string(user.steamid), user.name);
 		found = true;
 	}
 	if (!found) {
-		pisex::g_pMenus->AddItemMenu(menu, "0", Phrase("NoPlayers"), pisex::ITEM_DISABLED);
+		AddMenuItem(menu, "0", Phrase("NoPlayers"), /*disabled=*/true);
 	}
-	pisex::g_pMenus->SetExitMenu(menu, true);
-	pisex::g_pMenus->SetBackMenu(menu, true);
-	pisex::g_pMenus->SetCallback(menu, [type](const char* back, const char*, int item, int playerSlot) {
+	SetMenuExitButton(menu, true);
+	SetMenuExitBackButton(menu, true);
+	SetMenuCallback(menu, [type](const char* back, const char*, int item, int playerSlot) {
 		try {
 			if (item < kMenuSelectMax && back != nullptr) {
 				uint64_t steamid = 0;
@@ -545,7 +596,7 @@ void AdminPlugin::ShowPunishOfflineMenu(int32_t slot, int32_t type) {
 			LogError("admin_system: unknown exception in the offline punish menu");
 		}
 	});
-	pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+	DisplayMenu(std::move(menu), slot);
 }
 
 void AdminPlugin::ShowUnpunishOfflineMenu(int32_t slot, int32_t type) {
@@ -553,12 +604,21 @@ void AdminPlugin::ShowUnpunishOfflineMenu(int32_t slot, int32_t type) {
 		return;
 	}
 	// The original ran this query and built the menu in its callback; the menu is displayed a
-	// moment later (pisexcompat queues the display when called from a callback).
+	// moment later (the display is queued). The requester has to be re-checked there: the slot may
+	// have been reused by the time the rows arrive.
+	const uint64_t requester = SlotSteamId(slot);
+	if (requester == 0) {
+		return;
+	}
 	const bool unpunishAll = CoreOrNull() != nullptr && Core().HasPermission(slot, "@admin/unpunish_all");
 	const int limit = Cfg().unpunish_offline_count > 0 ? Cfg().unpunish_offline_count : 20;
 	std::string sql = "SELECT name, steamid FROM " + Core().TablePunishments() +
 					  " WHERE punish_type = ? AND (expires > ? OR expires = 0) AND unpunish_admin_id IS NULL";
 	std::vector<plgdb::Value> params{static_cast<int64_t>(type), static_cast<int64_t>(std::time(nullptr))};
+	// The same server_id condition as the UPDATE of UnpunishOffline(): a row of another server
+	// cannot be lifted here, so it must not be offered.
+	sql += " AND server_id = ?";
+	params.emplace_back(static_cast<int64_t>(Cfg().punish_server_id));
 	if (Cfg().unpunish_type == 0 && !unpunishAll) {
 		sql += " AND admin_id = ?";
 		params.emplace_back(static_cast<int64_t>(Core().FindAdmin(slot) == nullptr ? 1 : Core().FindAdmin(slot)->id));
@@ -566,27 +626,39 @@ void AdminPlugin::ShowUnpunishOfflineMenu(int32_t slot, int32_t type) {
 	sql += " ORDER BY id DESC LIMIT ?";
 	params.emplace_back(static_cast<int64_t>(limit));
 
-	m_db->Query(std::move(sql), std::move(params), [slot, type](const plgdb::Result& result) {
+	m_db->Query(std::move(sql), std::move(params), [slot, type, requester](const plgdb::Result& result) {
 		try {
-			pisex::Menu menu;
-			pisex::g_pMenus->SetTitleMenu(menu, g_adminPlugin.Phrase("SelectOfflinePlayer"));
+			const AdminCore* core = g_adminPlugin.CoreOrNull();
+			if (core == nullptr || g_adminPlugin.SlotSteamId(slot) != requester ||
+				!core->HasPermission(slot, kUnpunishPermissions[type])) {
+				return;
+			}
+			Menu menu;
+			SetMenuTitle(menu, g_adminPlugin.Phrase("SelectOfflinePlayer"));
 			if (result.Ok() && result.RowCount() > 0) {
 				for (std::size_t row = 0; row < result.RowCount(); ++row) {
 					const std::string name = result.GetString(row, 0);
 					const std::string steamid = result.GetString(row, 1);
-					pisex::g_pMenus->AddItemMenu(menu, steamid.c_str(), name.c_str());
+					AddMenuItem(menu, steamid, name);
 				}
 			} else {
-				pisex::g_pMenus->AddItemMenu(menu, "0", g_adminPlugin.Phrase("NoPlayers"), pisex::ITEM_DISABLED);
+				AddMenuItem(menu, "0", g_adminPlugin.Phrase("NoPlayers"), /*disabled=*/true);
 			}
-			pisex::g_pMenus->SetExitMenu(menu, true);
-			pisex::g_pMenus->SetBackMenu(menu, true);
-			pisex::g_pMenus->SetCallback(menu, [type](const char* back, const char* front, int item, int playerSlot) {
+			SetMenuExitButton(menu, true);
+			SetMenuExitBackButton(menu, true);
+			SetMenuCallback(menu, [type, requester](const char* back, const char* front, int item, int playerSlot) {
 				try {
 					if (item < kMenuSelectMax && back != nullptr) {
+						// The menu may have outlived the requester (slot reuse) and the action
+						// needs the same permission the type menu checked.
+						const AdminCore* clickCore = g_adminPlugin.CoreOrNull();
+						if (clickCore == nullptr || g_adminPlugin.SlotSteamId(playerSlot) != requester ||
+							!clickCore->HasPermission(playerSlot, kUnpunishPermissions[type])) {
+							return;
+						}
 						g_adminPlugin.RemoveOfflinePlayerPunishment(back, type, playerSlot);
-						pisex::g_pUtils->PrintToChat(playerSlot, g_adminPlugin.Phrase("UnPunishOfflineSuccess"),
-													 front != nullptr ? front : "");
+						PrintChat(playerSlot, g_adminPlugin.Phrase("UnPunishOfflineSuccess"),
+								  front != nullptr ? front : "");
 						g_adminPlugin.CloseAdminMenu(playerSlot);
 					} else if (item == kMenuSelectMax) {
 						g_adminPlugin.ShowPunishTypeMenu(playerSlot, true, true);
@@ -595,7 +667,7 @@ void AdminPlugin::ShowUnpunishOfflineMenu(int32_t slot, int32_t type) {
 					LogError("admin_system: unknown exception in the offline unpunish menu");
 				}
 			});
-			pisex::g_pMenus->DisplayPlayerMenu(menu, slot);
+			DisplayMenu(std::move(menu), slot);
 		} catch (const std::exception& ex) {
 			LogError(std::string("admin_system: exception while building the offline unpunish menu: ") + ex.what());
 		} catch (...) {

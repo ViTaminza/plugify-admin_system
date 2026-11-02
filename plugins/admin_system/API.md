@@ -9,7 +9,9 @@ Phase 1 (this document): the API design — the manifest, the generated consumer
 hand-written consumer wrapper `include/admin_api.hpp` and the engine-free core
 (`admin_core`: configuration, schema, admin loading, permissions, punishments).
 Phase 2 adds the engine glue (`src/plugin.cpp`: s2sdk listeners, commands, chat, menus, player
-lookups) on top of `admin_core` and `libs/pisexcompat`.
+lookups) on top of `admin_core` - pure s2sdk + plgdb, no `pisexcompat`
+(docs/PLUGIN_STANDARD.md §7). Version 1.2.0 is that native port; the exported API is unchanged
+(byte-for-byte the same symbol set) and `GetPluginVersion()` now answers 1.2.
 
 ## 1. Files
 
@@ -20,6 +22,12 @@ lookups) on top of `admin_core` and `libs/pisexcompat`.
 | `include/external/plugify/include/admin_system/admin_system.cpp` | The `__admin_system_*` binding slots. **Must be compiled into every consumer plugin** (like `s2sdk_bindings` / `permissions_bindings`); the Plugify module fills them when the plugin is loaded. |
 | `include/admin_api.hpp` | Hand-written consumer wrapper that restores the `IAdminApi` shape (`std::function` callbacks with captures, `std::string`/`std::vector<std::string>`, default arguments, `const char*` getters). |
 | `src/admin_core.hpp` / `.cpp` | Engine-free core (static library `admin_core`, plgdb only). |
+| `src/admin_config.hpp`, `src/kv1.hpp` | Engine-free file half: the KV1 reader, the candidate order of `core.ini` / `sorting.ini` / `databases.cfg` / `admin_system.phrases.txt`, the language chain and their parsers. |
+| `src/admin_guards.hpp` / `.cpp` | The plugin's own s2sdk guards: map gate (`B1`/`B2`), slot/controller checks (`C2`), signed entity handles (`C1`), the verified owner identity (SteamID64 + controller handle) and the Pisex printers. |
+| `src/admin_menus.hpp` / `.cpp`, `src/admin_menu_type.hpp` | The native s2sdk menu layer: deferred action queue, `MenuId 0` reservation, the A7 safe teardown, and the exact `ResolveS2sdkMenuTypeName` table. |
+| `src/admin_command_args.hpp` | The `CCommand`-style parser the ported command handlers use (content rebuilt from s2sdk's tokenized arguments). |
+| `tests/admin_config_tests.cpp` | The engine-free parsers, candidate order, language chain and command arguments. |
+| `tests/admin_menu_tests.cpp` | The menu-type table, the Pisex page-button translation and the command-content round-trip. |
 | `sym/version_script.lds` | Export list of the shared library (keep in sync with the manifest). |
 | `tests/admin_core_tests.cpp` | SQLite + MySQL tests of the core. |
 | `tests/admin_api_tests.cpp` | Tests of the consumer wrapper with stubbed binding slots. |
@@ -72,6 +80,7 @@ the checked-in headers are used).
 | 10 | `bool HasPermission(int, const char*)` | `bool HasPermission(int32 slot, const plg::string&)` | admins |
 | 11 | `bool HasFlag(int, const char*)` | `bool HasFlag(int32 slot, const plg::string&)` | admins |
 | 12 | `bool IsAdmin(int)` | `bool IsAdmin(int32 slot)` | admins |
+| 12b | — (no `IAdminApi` counterpart, added in 1.1.0) | `bool IsClientAdminDataReady(int32 slot, uint64_t steamid)` | admins |
 | 13 | `const char* GetFlagName(const char*)` | `plg::string GetFlagName(const plg::string&)` | admins |
 | 14 | `vector<string> GetPermissionsByFlag(const char*)` | `plg::vector<plg::string> GetPermissionsByFlag(const plg::string&)` | admins |
 | 15 | `vector<string> GetAdminFlags(int)` | `plg::vector<plg::string> GetAdminFlags(int32 slot)` | admins |
@@ -112,7 +121,8 @@ the checked-in headers are used).
 | 50 | `int GetImmunityType()` (see 22) | — | — |
 
 50 methods → **60 exports** (10 registration methods become 20 Register/Unregister exports; #22
-and #50 are the same method listed twice in the original header).
+and #50 are the same method listed twice in the original header), plus one addition of the port:
+`IsClientAdminDataReady` (row 12b, API 1.1.0) — **61 exports** in total.
 
 ## 4. Callback values
 
@@ -136,6 +146,63 @@ and #50 are the same method listed twice in the original header).
 punishment reload (`mm_as_reload_punish` in the original) the plugin has no slot for a
 punishment issued by someone who is offline, so - exactly like the original - it passes the
 **database id** of the admin row (`-1` when it is the console row).
+
+### 4.1 Admin load readiness (API 1.1.0)
+
+The admin record of a player is loaded by an **asynchronous** `SELECT` (`admin_core.cpp`,
+`LoadAdmin`): `IsAdmin()`/`HasPermission()`/`HasFlag()` answer `false` until the answer arrives,
+which is indistinguishable from "this player is not an admin". `OnAdminConnected` only fires when
+a row was **found**, and `IsCoreLoaded()` only says that the database, the schema and the config
+are up - none of them is a per-player completion signal.
+
+`IsClientAdminDataReady(slot, steamid)` is that signal. The core keeps a per-slot load state:
+
+| State | Meaning | `IsClientAdminDataReady` |
+| --- | --- | --- |
+| `Unknown` | no load requested for the current slot generation (start, `ResetSlot`, reclaimed slot, destroyed/not-ready core) | `false` |
+| `Pending` | the `SELECT` is queued and has not answered | `false` |
+| `Ready` | the `SELECT` answered - **a row or no row**. The in-memory record is authoritative for the requested steamid; "no row" is the definitive "not an admin" | `true` when the steamid matches |
+| `Failed` | the `SELECT` failed (a plgdb error); the record is **not** authoritative and the core retries it | `false` |
+
+The call is atomic: it checks that the core is ready, the slot is in `0..63`, the state is
+`Ready`, the answer belongs to **exactly** the given SteamID64 and that the id is not `0`. A slot
+that was reset/reused (new generation), a newer load request, an unknown identity, the console
+(`-1`), out-of-range slots and an old admin_system without the binding all answer `false`.
+
+**Contract for consumers:**
+
+```cpp
+if (!admin->IsClientAdminDataReady(slot, liveSteamId)) {
+    return;                       // ask again later - do NOT treat as "not an admin"
+}
+if (!admin->HasPermission(slot, "@admin/reserve")) {
+    // ... the definitive "not an admin" answer:
+}
+```
+
+* `false` means *wait* (the retry backoff is 10/20/40/60 s per slot inside the plugin). A
+  consumer that acts on "no permission" (kicks a reserved slot, denies a command) must gate that
+  action on this call first; that turns a slow/failing `SELECT` from a false kick into a short
+  delay.
+* `true` means the answer is authoritative **for the given steamid** - not that the player is an
+  admin. `IsAdmin()`/`HasPermission()`/`HasFlag()` may still be false, and that is the final word.
+* The steamid must be the live client's current SteamID64 (a stale id from a previous occupant of
+  the slot answers `false` until the new player's load finishes).
+* `OnCoreLoaded` does not imply readiness for any player, and the state is not a client query:
+  the consumer still does its own map/slot/identity guards.
+* An admin_system older than 1.1.0 has no binding for the call; `admin_api.hpp` then answers
+  `false` (never crash) - declare `admin_system >= 1.1.0` in the manifest of a consumer that
+  relies on it.
+* The state describes the **load**, not the rights: local flags, expiry (`ExpireState`) or a
+  `RemoveAdmin()` change the rights while the state stays `Ready`.
+* Retry policy (internal): the two statements are retried separately, and a punishment query is
+  only re-queued while its own answer is still missing - an answered punishment load is never
+  replayed, so a ban is not applied twice on a normal retry. Residual risk (pre-existing): a
+  punishment `SELECT` that is genuinely still queued when its retry window expires is re-queued to
+  recover from a statement stuck behind a connect timeout; that duplicate re-applies the same rows
+  and can fire the ban/kick callback again. It cannot happen once `onPunishmentsLoaded` arrived.
+  Likewise an admin/reread load is retried only after its window, never in the same tick it was
+  queued from outside the reconcile.
 
 ## 5. Using the API from a module
 
@@ -228,9 +295,9 @@ database/permission/punishment logic is unit-testable and phase 2 stays glue:
   `unpunish_offline_count`, `static_name`, `message_type`, `own_reason`,
   `mute_ignore_commands`, `default_permissions`, the `flags` map (name + `access` list), and the
   `reasons` / `times` / `times_reasons` tables of the punishment menus. The defaults are the
-  values of the shipped `core.ini`; phase 2 fills the
-  struct from the `.ini` with the pisexcompat KeyValues parser. `database_prefix` is validated
-  (plain identifier, ≤ 32 chars) because it is interpolated into SQL.
+  values of the shipped `core.ini`; the plugin's own KV1 reader (`src/kv1.hpp`) fills the struct
+  from the `.ini` (`src/admin_config.hpp`), keeping the original's getter defaults. `database_prefix`
+  is validated (plain identifier, ≤ 32 chars) because it is interpolated into SQL.
 * **Schema** — byte for byte the `CREATE TABLE` statements of `database.cpp` for
   `{prefix}groups`, `{prefix}admins`, `{prefix}admins_servers`, `{prefix}punishments`
   (only `AUTO_INCREMENT` / `AUTOINCREMENT` differs per driver) plus the reserved console row
@@ -293,15 +360,18 @@ core was destroyed are dropped (a lifetime token guards every callback).
   original only tracked connected players, its `g_mOfflineUsers` list is a menu feature of
   phase 2).
 * `RemoveOfflinePlayerPunishment` runs the `UPDATE` directly (the original ran the same query
-  as a `SELECT` first to decide whether to run it).
+  as a `SELECT` first to decide whether to run it); `onPlayerUnpunish`/`onOfflinePlayerUnpunish`
+  fire from its callback only when it affected a row, so a caller that was not allowed to lift
+  the punishment (the `unpunish_type`/`server_id` filters) no longer reports a fake unpunishment
+  to the modules. The in-memory punishment is still cleared immediately.
 
 ## 8. The engine side (phase 2)
 
 `src/plugin.cpp` (lifecycle, config/phrases/database, s2sdk listeners, reconcile, the core hooks,
 the notifications and the 60 exports), `src/commands.cpp` (the commands) and `src/menus.cpp` (the
-admin menu) port `admin_system.cpp` + `menus.cpp` onto admin_core + pisexcompat. `package.sh` lays
+admin menu) port `admin_system.cpp` + `menus.cpp` onto admin_core + native s2sdk. `package.sh` lays
 out the ready-to-drop package (configs and phrases taken from an existing installation, the
-manifest, the `.so` and a `databases.cfg` template).
+manifest, the `.so` and a `databases.cfg` template without credentials).
 
 Commands (same names, permissions and messages as the original):
 
@@ -310,6 +380,32 @@ Commands (same names, permissions and messages as the original):
 | console | `mm_ban`, `mm_mute`, `mm_gag`, `mm_silence`, `mm_unban`, `mm_unmute`, `mm_ungag`, `mm_unsilence`, `mm_add_admin`, `mm_remove_admin`, `mm_add_group`, `mm_remove_group`, `mm_admin`, `css_admin`, `mm_as_reload_config`, `mm_as_reload_admin`, `mm_as_reload_punish` |
 | chat | `!admin`, `!ban`, `!mute`, `!gag`, `!silence`, `!unban`, `!unmute`, `!ungag`, `!unsilence`, `!add_admin`, `!remove_admin`, `!add_group`, `!remove_group` |
 | new | `as_status` (RCON report: per human slot the steamid, admin state, flags, immunity, group and active punishments, plus the prefix/server ids and the pending statement count) |
+
+Safety rules of the native glue (all covered by `src/admin_guards.cpp` / `src/admin_menus.cpp`):
+
+* **Map gate (`B1`/`B2`).** `OnMapStart`/`OnMapEnd` (both halves required before registering) open
+  and close the gate; a plugin reloaded into a running map opens it on the *first* `OnPluginUpdate`
+  only, and only while no `OnMapEnd` was seen and `s2sdk::GetCurrentMap()` reports a real map.
+  With the gate closed there is not a single client, entity or schema call - the per-second pump,
+  the reconcile, the ban kicks and the menu layer all return first.
+* **No s2sdk timers (`C9`).** The original's one-second expiry/reconcile timer, the `plgdb` pump
+  and the `ban_delay` kick are driven from `OnPluginUpdate`; `CreateTimer` is not used at all.
+* **Menus (`C10`/`C13`).** Every menu action (display, close, selection, exit/back) is queued and
+  applied from `OnPluginUpdate` with a re-validated owner (SteamID64 + controller handle) and
+  `IsClientAdminDataReady`; `MenuId 0` is reserved by a dummy menu; `CreateMenu` is only called
+  when the complete menu binding set is present; ended menus are destroyed outside the menu
+  manager's lock, and map-end/unload ends a display with `CancelClientMenu(Disconnect)` first,
+  falling back to the built-in `chat`/`console` backend before `DestroyMenu` (`A7`; an impossible
+  case is logged as `A7_UNRESOLVED`).
+* **Menu type.** The optional `hudmenu` dependency is asked for the player's own `!menu` choice
+  (`hudmenu::GetClientMenuType`), with the exact pisexcompat table: `HUD_LAYOUT` maps to `hud`
+  when that backend is registered and to the built-in `button` otherwise.
+* **Commands (`C11`).** Console names are registered with `AddConsoleCommand` (or only a listener
+  when the name already exists, which `UnregisterCommands` detaches symmetrically); `jointeam` is
+  reached through the global command listener; the `mm_*` commands are server-console only (no
+  `ClientCanExecute` *and* a `caller >= 0` rejection), and `as_status` answers only `caller == -1`.
+* **Events.** `round_start` is hooked only while `static_name = 1`, both halves of the event pair
+  are required, and the handler answers `Continue` (the engine's own handling runs).
 
 Flow: `OnPluginStart` reads `core.ini` / `sorting.ini` / `admin_system.phrases.txt`, opens the
 database from the `admin_system` section of `databases.cfg` (a missing entry falls back to a local
@@ -347,3 +443,25 @@ IP, expired, permanent, merge order, forced reload), unpunish rules, local chang
 `tests/admin_api_tests.cpp` — the consumer wrapper with stubbed binding slots: null-slot safety,
 plg ↔ std conversions, caches, database config, and the trampolines (captures, out-parameters,
 exception safety).
+`plugins/admin_system/tests/admin_config_tests.cpp` — the KV1 reader, the `core.ini` /
+`sorting.ini` / `databases.cfg` / `admin_system.phrases.txt` parsers, the pisexcompat candidate
+order and language chain, and the command argument handling (engine-free).
+`plugins/admin_system/tests/admin_menu_tests.cpp` — the exact `ResolveS2sdkMenuTypeName` table,
+the Pisex page-button translation and the command-content quoting round-trip (engine-free).
+`plugins/admin_system/tests/admin_runtime_tests.cpp` — the real plugin translation units with every
+s2sdk/hudmenu binding null: `OnPluginStart` answers Ok, every registration degrades to a no-op, the
+exported methods return their neutral values, the SQLite fail-soft path creates the schema,
+`OnPluginUpdate`/`OnChatPre`/the menu entry points touch nothing, and `OnPluginEnd` tears the plugin
+down (`A1`/`A7`).
+`plugins/admin_system/tests/admin_gate_tests.cpp` — the s2sdk guards against recording fakes: the
+mid-map latch opens only with both map listeners, no `OnMapEnd`, a present `GetCurrentMap` binding
+and a real map name (`""`/`"<empty>"`/missing binding keep the gate shut); `OnMapEnd` closes it and
+only a new `OnMapStart` re-opens it; signed entity handles (`0`/`-1` invalid, a negative high-serial
+handle valid); the slot/controller chain and the owner identity (SteamID64 + controller handle);
+`PrintConsole` prints to the server console only for exactly slot `-1` (`B1`/`C1`/`C2`/`C11`).
+`plugins/admin_system/tests/admin_commands_tests.cpp` — the command layer against recording fakes
+with a live SQLite database: strict callers (`-2`/`64` are swallowed without a permission check or a
+reply, `mm_*` are server-console-only, chat spellings are not dispatched from a console context), the
+admin-data readiness gate of the permission check (a re-used slot is not authorized by the previous
+occupant's cached record) and the owner-verified deferred replies of the offline punishment and group
+inserts (`C11`, and the slot-reuse rule of the API).

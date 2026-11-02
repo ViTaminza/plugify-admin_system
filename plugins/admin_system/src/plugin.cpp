@@ -1,24 +1,32 @@
 // admin_system — engine side: lifecycle, configuration, s2sdk listeners, the once-per-second
-// reconcile/expiry timer, the admin_core hook bodies, the punishment notifications of the
-// original and the 60 exported methods (the IAdminApi of the Pisex cs2-admin_system plugin).
+// reconcile/expiry pump, the admin_core hook bodies, the punishment notifications of the original
+// and the 60 exported methods (the IAdminApi of the Pisex cs2-admin_system plugin).
 //
 // Ported from the original cs2-admin_system (admin_system.cpp, database.cpp, menus.cpp) onto
-// libs/pisexcompat + admin_core. Commands live in commands.cpp, the menu in menus.cpp.
+// native s2sdk + plgdb (docs/PLUGIN_STANDARD.md §7: no pisexcompat). Commands live in
+// commands.cpp, the menu in menus.cpp, the s2sdk guards in admin_guards.cpp and the menu layer in
+// admin_menus.cpp.
 //
 // Rules this file follows:
 //   * nothing here blocks on the database except the startup path (CreateSchema in EnsureCore);
 //   * every s2sdk/plugify callback catches its exceptions (a throw into the module would kill the
 //     server, not the plugin);
-//   * no client query before a map exists - pisexcompat's player wrappers return neutral values
-//     until then, and the reconcile only runs from OnPluginUpdate (pumped with a live map);
-//   * the plugin never returns Failed from OnPluginStart (that stops every plugify plugin); a
-//     missing binding or a broken config leaves it running as a no-op core.
+//   * no client query before a map exists and none in the OnMapEnd window - admin_guards.cpp owns
+//     that gate (PITFALLS B1/B2) and every client access below goes through it;
+//   * the plugin never returns Failed from OnPluginStart (that stops every plugify plugin,
+//     PITFALLS A1); a missing binding or a broken config leaves it running as a no-op core;
+//   * no s2sdk timer is created (PITFALLS C9): the one-second expiry/reconcile work, the database
+//     Poll() and the ban-delay kicks all run from OnPluginUpdate;
+//   * OnPluginEnd drops every registration symmetrically (PITFALLS A7): the client listeners, the
+//     chat listeners, the console commands, the static-name command listener/game event, every
+//     menu (A7_UNRESOLVED when one cannot be removed safely) and the map listeners.
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdlib>
 #include <ctime>
 #include <exception>
+#include <filesystem>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -29,31 +37,18 @@
 #include <plugin_export.h>
 #include <s2sdk/s2sdk.hpp>
 
-#include <pisex/pisex.hpp>
-
 #include <admin_system/admin_system.hpp>
 
+#include "admin_config.hpp"
+#include "admin_guards.hpp"
+#include "admin_menus.hpp"
 #include "admin_plugin.hpp"
 
 namespace admin_system {
 
 AdminPlugin g_adminPlugin;
 
-// --- logging / small helpers -----------------------------------------------------------
-
-void LogMessage(std::string_view message, plg::Severity severity) {
-	if (plg::Log) {
-		plg::Log(message, severity, plg::source_location::current());
-	}
-}
-
-void LogInfo(std::string_view message) {
-	LogMessage(message, plg::Severity::Info);
-}
-
-void LogError(std::string_view message) {
-	LogMessage(message, plg::Severity::Error);
-}
+// --- small helpers ---------------------------------------------------------------------
 
 std::string ToString(std::string_view view) {
 	return std::string(view);
@@ -80,7 +75,7 @@ namespace {
 
 constexpr std::size_t kMaxOfflineUsers = 256;
 constexpr auto kReconcileInterval = std::chrono::seconds(1);
-constexpr float kSecondTimerInterval = 1.0f;
+constexpr std::string_view kDefaultDataFile = "admin_system.sqlite3";
 
 std::string ToString(const plg::string& text) {
 	return std::string(std::string_view(text));
@@ -106,177 +101,148 @@ void RemoveListener(std::vector<Callback>& list, Callback callback) {
 
 void OnClientAuthenticatedListener(int32_t playerSlot, uint64_t steamid);
 void OnClientDisconnectListener(int32_t playerSlot, s2sdk::NetworkDisconnectionReason reason);
+s2sdk::ResultType OnStaticNameCommandListener(int32_t caller, s2sdk::ConCommandContext context,
+											  const plg::vector<plg::string>& args);
+s2sdk::ResultType OnRoundStartEvent(const plg::string& name, void* event, bool dontBroadcast);
+s2sdk::ResultType OnSayListener(int32_t caller, s2sdk::ConCommandContext context,
+								const plg::vector<plg::string>& args);
+
+// The map gate hooks (admin_guards.cpp calls them from the s2sdk listeners / the mid-map latch).
+// Named OnMapGate* so they cannot be confused with the AdminPlugin member functions of the same
+// meaning.
+void OnMapGateStart();
+void OnMapGateEnd();
+
+// The menu layer's eligibility hook: the owner is unchanged AND the admin data of the slot is
+// authoritative for that steamid.
+bool MenuOwnerEligibleTrampoline(void* user, const OwnerIdentity& owner);
+
+// The config/data directories of this plugin (empty when the host did not provide them).
+std::string ConfigsDir() {
+	if (!plg::GetConfigsDir) {
+		return {};
+	}
+	return std::string(std::string_view(plg::GetConfigsDir()));
+}
+
+std::string DataDir() {
+	if (!plg::GetDataDir) {
+		return {};
+	}
+	return std::string(std::string_view(plg::GetDataDir()));
+}
+
+// s2sdk's ServerLanguage (the fallback of the language chain, core.cfg wins).
+std::string ServerLanguage() {
+	if (__s2sdk_GetServerLanguage == nullptr) {
+		return {};
+	}
+	try {
+		const plg::string language = s2sdk::GetServerLanguage();
+		return std::string(std::string_view(language));
+	} catch (...) {
+		return {};
+	}
+}
 
 } // namespace
 
 // --- configuration ---------------------------------------------------------------------
 
 bool AdminPlugin::LoadCoreConfig() {
-	// LoadConfig() of the original, key for key. The built-in defaults are the values of the
-	// shipped core.ini, so a reload that drops a key cannot silently change the behaviour.
+	// LoadConfig() of the original, key for key (the file parser is engine-free: admin_config.hpp).
+	// A missing or malformed file leaves the built-in defaults in place, exactly like the original's
+	// failed LoadFromFile did (the Config defaults are the values of the shipped core.ini).
 	Config config;
-	config.database_prefix = std::string(kDefaultPrefix);
-
-	pisex::KeyValues kv("Config");
-	if (!kv.LoadFromFile("addons/configs/admin_system/core.ini")) {
-		LogError("admin_system: cannot read core.ini - keeping the built-in defaults");
-		m_config = std::move(config);
-		return false;
-	}
-
-	if (const std::string_view prefix = kv.GetStringValue("database_prefix", kDefaultPrefix); !prefix.empty()) {
-		config.database_prefix = std::string(prefix);
-	}
-	config.admin_server_id = kv.GetInt("admin_server_id", -1);
-	config.punish_server_id = kv.GetInt("punish_server_id", -1);
-	config.punish_ip = kv.GetBool("punish_ip", false);
-	config.time_reason_type = kv.GetInt("time_reason_type", 0);
-	config.ban_delay = kv.GetInt("ban_delay", 0);
-	config.notify_type = kv.GetInt("notify_type", 0);
-	config.unpunish_type = kv.GetInt("unpunish_type", 0);
-	config.immunity_type = kv.GetInt("immunity_type", 0);
-	config.punish_offline_count = kv.GetInt("punish_offline_count", 0);
-	config.unpunish_offline_count = kv.GetInt("unpunish_offline_count", 0);
-	config.static_name = kv.GetBool("static_name", false);
-	config.message_type = kv.GetInt("message_type", 0);
-	config.own_reason = kv.GetBool("own_reason", false);
-	config.mute_ignore_commands = kv.GetBool("mute_ignore_commands", true);
-
-	if (pisex::KeyValues* defaults = kv.FindKey("default_permissions", false)) {
-		FOR_EACH_VALUE(defaults, value) {
-			if (value->GetInt(nullptr, 0) != 0) {
-				config.default_permissions.emplace_back(value->GetName());
-			}
-		}
-	}
-
-	if (pisex::KeyValues* flags = kv.FindKey("flags", false)) {
-		FOR_EACH_SUBKEY(flags, flag) {
-			Flag parsed;
-			parsed.name = flag->GetString("name", "");
-			if (pisex::KeyValues* access = flag->FindKey("access", false)) {
-				FOR_EACH_VALUE(access, permission) {
-					if (permission->GetInt(nullptr, 0) != 0) {
-						parsed.permissions.emplace_back(permission->GetName());
-					}
-				}
-			}
-			config.flags[flag->GetName()] = std::move(parsed);
-		}
-	}
-
-	// The punishment menu tables: either "reasons" + "times" (time_reason_type = 0) or
-	// "times_reasons" (time_reason_type = 1), exactly as LoadConfig() reads them.
-	const char* typeKeys[kPunishmentTypes] = {"bans", "mutes", "gags", "silences"};
-	if (config.time_reason_type != 0) {
-		if (pisex::KeyValues* timesReasons = kv.FindKey("times_reasons", false)) {
-			for (int type = 0; type < kPunishmentTypes; ++type) {
-				pisex::KeyValues* perType = timesReasons->FindKey(typeKeys[type], false);
-				if (perType == nullptr) {
-					continue;
-				}
-				FOR_EACH_SUBKEY(perType, reason) {
-					ReasonTimes entry;
-					entry.reason = reason->GetName();
-					FOR_EACH_VALUE(reason, time) {
-						entry.times.emplace_back(std::atoi(time->GetName()), time->GetString(nullptr));
-					}
-					config.reasons_times[type].push_back(std::move(entry));
-				}
-			}
-		}
-	} else {
-		if (pisex::KeyValues* reasons = kv.FindKey("reasons", false)) {
-			for (int type = 0; type < kPunishmentTypes; ++type) {
-				pisex::KeyValues* perType = reasons->FindKey(typeKeys[type], false);
-				if (perType == nullptr) {
-					continue;
-				}
-				FOR_EACH_VALUE(perType, reason) {
-					if (reason->GetInt(nullptr, 0) != 0) {
-						config.reasons[type].emplace_back(reason->GetName());
-					}
-				}
-			}
-		}
-		if (pisex::KeyValues* times = kv.FindKey("times", false)) {
-			for (int type = 0; type < kPunishmentTypes; ++type) {
-				pisex::KeyValues* perType = times->FindKey(typeKeys[type], false);
-				if (perType == nullptr) {
-					continue;
-				}
-				FOR_EACH_VALUE(perType, time) {
-					config.times[type].emplace_back(std::atoi(time->GetName()), time->GetString(nullptr));
-				}
-			}
-		}
-	}
-
+	std::string usedPath;
+	const bool loaded = LoadCoreConfigFile(ConfigCandidates(ConfigsDir(), DataDir(), kCoreIniFile), config, usedPath);
 	m_config = std::move(config);
-	return true;
+	if (!loaded) {
+		LogError("admin_system: cannot read core.ini (" + usedPath + ") - keeping the built-in defaults");
+	}
+	return loaded;
 }
 
 bool AdminPlugin::LoadSortingIni() {
 	m_sortCategories.clear();
 	m_sortItems.clear();
+	std::string usedPath;
+	if (LoadSortingFile(ConfigCandidates(ConfigsDir(), DataDir(), kSortingIniFile), m_sortCategories, m_sortItems,
+						usedPath)) {
+		return true;
+	}
+	LogError("admin_system: cannot read sorting.ini (" + usedPath +
+			 ") - the menus fall back to the registry order");
+	return false;
+}
 
-	pisex::KeyValues kv("Config");
-	if (!kv.LoadFromFile("addons/configs/admin_system/sorting.ini")) {
-		LogError("admin_system: cannot read sorting.ini - the menus fall back to the registry order");
+bool AdminPlugin::LoadPhrases() {
+	// The server's admin_system.phrases.txt holds the phrases of the core *and* of the modules
+	// (the modules ask the core for their keys), exactly like on the Metamod server.
+	m_language = PickLanguage(CoreConfigLanguage(ConfigsDir()), ServerLanguage());
+	m_phrases.clear();
+	std::string usedPath;
+	std::optional<std::map<std::string, std::string, std::less<>>> phrases =
+		LoadFirstPhrases(PhraseCandidates(ConfigsDir()), m_language, usedPath);
+	if (!phrases) {
+		LogError("admin_system: cannot read admin_system.phrases.txt (" + usedPath +
+				 ") - phrase keys are printed as-is");
 		return false;
 	}
-	FOR_EACH_SUBKEY(&kv, category) {
-		const std::string name = category->GetName();
-		m_sortCategories.push_back(name);
-		FOR_EACH_VALUE(category, item) {
-			m_sortItems[name].emplace_back(item->GetString(nullptr));
-		}
-	}
+	m_phrases = std::move(*phrases);
 	return true;
 }
 
-bool AdminPlugin::LoadPhrasesFiles() {
-	// The server's admin_system.phrases.txt holds the phrases of the core *and* of the modules
-	// (the modules ask the core for their keys), exactly like on the Metamod server.
-	pisex::g_translations.clear();
-	if (!pisex::LoadPhrases("admin_system.phrases.txt")) {
-		LogError("admin_system: cannot read admin_system.phrases.txt - phrase keys are printed as-is");
-		return false;
+const char* AdminPlugin::Phrase(const char* key) const {
+	if (key == nullptr) {
+		return "";
 	}
-	return true;
+	const auto found = m_phrases.find(key);
+	return found == m_phrases.end() ? key : found->second.c_str();
 }
 
 // --- startup -------------------------------------------------------------------------
 
 bool AdminPlugin::EnsureCore() {
+	if (m_core != nullptr) {
+		// Retry after a failed CreateSchema: the database and the core (with its hooks) are
+		// already in place, only the schema attempt is repeated.
+		try {
+			m_core->CreateSchema();
+		} catch (const std::exception& ex) {
+			LogError(std::string("admin_system: creating the tables failed: ") + ex.what());
+			return false;
+		}
+		m_coreReady = true;
+		return true;
+	}
+
 	// Database settings: the databases.cfg entry of the original (section "admin_system"), with
-	// "driver" and "sqlite_path" as optional keys for a SQLite server.
+	// "driver" and "sqlite_path" as optional keys for a SQLite server. The candidate order is the
+	// one the Pisex loader used (see admin_config.hpp); the plugin's own
+	// <configs>/admin_system/databases.cfg wins over nothing else that exists.
+	const std::string configsDir = ConfigsDir();
+	const std::string dataDir = DataDir();
 	plgdb::Config database;
 	database.driver = plgdb::Driver::MySQL;
-	pisex::KeyValues kv("Databases");
-	bool haveConfig = false;
-	if (kv.LoadFromFile("addons/configs/databases.cfg")) {
-		if (pisex::KeyValues* entry = kv.FindKey("admin_system", false)) {
-			haveConfig = true;
-			if (const std::string driver = entry->GetString("driver", "mysql"); driver == "sqlite") {
-				database.driver = plgdb::Driver::SQLite;
-			}
-			database.host = entry->GetString("host", "127.0.0.1");
-			database.port = static_cast<uint16_t>(std::max(1, std::min(65535, entry->GetInt("port", 3306))));
-			database.user = entry->GetString("user", "");
-			database.password = entry->GetString("pass", "");
-			database.database = entry->GetString("database", "admin_system");
-			if (database.driver == plgdb::Driver::SQLite) {
-				database.sqlitePath = pisex::ResolveDataPath(entry->GetString("sqlite_path", "admin_system.sqlite3"));
-			}
+	std::string usedPath;
+	const DatabaseSettings settings = LoadDatabaseSettings(DatabaseCandidates(configsDir, dataDir), usedPath);
+	if (settings.found) {
+		if (settings.sqlite) {
+			database.driver = plgdb::Driver::SQLite;
+			database.sqlitePath = ResolveSqlitePath(dataDir, settings.sqlitePath);
 		}
-	}
-	if (!haveConfig) {
+		database.host = settings.host;
+		database.port = static_cast<uint16_t>(settings.port);
+		database.user = settings.user;
+		database.password = settings.password;
+		database.database = settings.database;
+	} else {
 		// Fail soft: a local SQLite file keeps the plugin usable without a databases.cfg.
-		LogError("admin_system: no 'admin_system' entry in addons/configs/databases.cfg - "
-				 "falling back to a local SQLite database");
+		LogError("admin_system: no 'admin_system' entry in addons/configs/databases.cfg (looked at " + usedPath +
+				 ") - falling back to a local SQLite database");
 		database.driver = plgdb::Driver::SQLite;
-		database.sqlitePath = pisex::ResolveDataPath("admin_system.sqlite3");
+		database.sqlitePath = ResolveSqlitePath(dataDir, std::string(kDefaultDataFile));
 	}
 
 	m_dbConfig = database;
@@ -355,7 +321,67 @@ bool AdminPlugin::EnsureCore() {
 		LogError(std::string("admin_system: creating the tables failed: ") + ex.what());
 		return false;
 	}
+	m_coreReady = true;
 	return true;
+}
+
+void AdminPlugin::RetryCore() {
+	// The database was not reachable when the plugin started: CreateSchema is retried from the
+	// per-second pump with the backoff below, so the core (commands, menus, modules waiting for
+	// OnCoreLoaded) comes up without a manual `plg reload admin_system`.
+	if (m_coreReady || m_coreProbePending || std::chrono::steady_clock::now() < m_coreRetryAt) {
+		return;
+	}
+	if (m_db == nullptr) {
+		// EnsureCore() creates m_db/m_core *before* its CreateSchema() call, so a failed schema
+		// attempt always leaves both in place. Without them only the local database setup can
+		// have failed (an invalid configuration or a thread-spawn error); rebuilding it is local
+		// work, not a network operation.
+		if (EnsureCore()) {
+			LogInfo("admin_system: the database is available - the core is ready");
+			RunStartupWork();
+			return;
+		}
+		ScheduleCoreRetry();
+		return;
+	}
+	// Probe asynchronously first: a blackholed MySQL keeps every statement in the connect
+	// timeout on the worker thread, and CreateSchema() is a blocking QuerySync - calling it
+	// from the game thread would freeze the server for ~10 s per attempt. Only a probe that
+	// answered lets the game thread run the schema (the connection is then established, so it
+	// completes quickly).
+	m_coreProbePending = true;
+	m_db->Query("SELECT 1", {}, [this](const plgdb::Result& result) {
+		m_coreProbePending = false;
+		if (!result.Ok()) {
+			ScheduleCoreRetry();
+			return;
+		}
+		if (EnsureCore()) {
+			LogInfo("admin_system: the database is available - the core is ready");
+			RunStartupWork();
+			return;
+		}
+		ScheduleCoreRetry();
+	});
+}
+
+void AdminPlugin::ScheduleCoreRetry() {
+	m_coreRetryDelaySeconds = std::min(m_coreRetryDelaySeconds * 2, 60);
+	m_coreRetryAt = std::chrono::steady_clock::now() + std::chrono::seconds(m_coreRetryDelaySeconds);
+	LogError("admin_system: the core is still not ready - the next attempt is in " +
+			 std::to_string(m_coreRetryDelaySeconds) + "s");
+}
+
+void AdminPlugin::RunStartupWork() {
+	// StartupServer runs on the first update with a map; when the database was down at plugin
+	// start the retry calls this as soon as the schema exists. m_coreLoaded keeps it once-only.
+	if (m_core == nullptr || !m_coreReady || m_coreLoaded) {
+		return;
+	}
+	Core().RemoveExpiredAdmins();
+	BroadcastCoreLoaded();
+	ReconcileSlots();
 }
 
 void AdminPlugin::RegisterStaticNameHooks() {
@@ -364,34 +390,40 @@ void AdminPlugin::RegisterStaticNameHooks() {
 	if (!m_config.static_name) {
 		return;
 	}
-	pisex::g_pUtils->RegCommand({"jointeam"}, {}, [](int32_t slot, const char*) {
+	// "jointeam" is not a ConCommand in CS2 (the game parses it in its ClientCommand path), so
+	// neither AddConsoleCommand (it would shadow the game command) nor a named listener works:
+	// s2sdk runs the GLOBAL listeners for every client command, so one global listener dispatches
+	// it by name (the same route pisexcompat used, PITFALLS C11).
+	if (__s2sdk_AddCommandListener != nullptr && __s2sdk_RemoveCommandListener != nullptr) {
 		try {
-			if (slot >= 0 && slot < kMaxSlots) {
-				const AdminRecord* admin = g_adminPlugin.FindAdmin(slot);
-				if (admin != nullptr && admin->id > 0 && !admin->name.empty()) {
-					pisex::g_pPlayers->SetPlayerName(slot, admin->name.c_str());
-				}
+			if (s2sdk::AddCommandListener(plg::string(), &OnStaticNameCommandListener, s2sdk::HookMode::Pre)) {
+				m_staticNameCommandRegistered = true;
+			} else {
+				LogError("admin_system: could not hook the client command dispatcher for the static name");
 			}
 		} catch (...) {
-			LogError("admin_system: unknown exception in the static-name jointeam hook");
+			LogError("admin_system: hooking the client command dispatcher failed");
 		}
-		return false; // the original let the command through (MRES_IGNORED)
-	});
-	pisex::g_pUtils->HookEvent("round_start", [](const char*, pisex::IGameEvent*, bool) {
+	} else {
+		LogError("admin_system: AddCommandListener/RemoveCommandListener is unavailable - the static "
+				 "name is not applied on jointeam");
+	}
+	// Both halves of the event pair are required before the hook (PITFALLS A7).
+	if (__s2sdk_HookEvent != nullptr && __s2sdk_UnhookEvent != nullptr) {
 		try {
-			for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
-				if (!pisex::g_pPlayers->IsConnected(slot)) {
-					continue;
-				}
-				const AdminRecord* admin = g_adminPlugin.FindAdmin(slot);
-				if (admin != nullptr && admin->id > 0 && !admin->name.empty()) {
-					pisex::g_pPlayers->SetPlayerName(slot, admin->name.c_str());
-				}
+			if (s2sdk::HookEvent(plg::string("round_start"), &OnRoundStartEvent, s2sdk::HookMode::Pre) ==
+				s2sdk::EventHookError::Okay) {
+				m_roundStartHooked = true;
+			} else {
+				LogError("admin_system: s2sdk refused the round_start hook for the static name");
 			}
 		} catch (...) {
-			LogError("admin_system: unknown exception in the static-name round_start hook");
+			LogError("admin_system: hooking round_start failed");
 		}
-	});
+	} else {
+		LogError("admin_system: HookEvent/UnhookEvent is unavailable - the static name is not applied "
+				 "on round_start");
+	}
 }
 
 void AdminPlugin::RegisterCoreMenus() {
@@ -427,93 +459,119 @@ void AdminPlugin::BroadcastCoreLoaded() {
 
 plg::PluginResult AdminPlugin::OnPluginStart() {
 	try {
-		if (!pisex::Init("admin_system")) {
-			LogError("admin_system: the s2sdk bindings are not available (is the s2sdk plugin >= 2.18.2 loaded?) - "
-					 "the engine half of the plugin stays off, the API keeps serving other plugins");
-		}
 		LoadCoreConfig();
-		LoadPhrasesFiles();
+		LoadPhrases();
 		LoadSortingIni();
 
 		if (!EnsureCore()) {
-			// Fail soft: the plugin stays loaded, the API answers with neutral values and the
-			// commands report that the core is not ready.
-			LogError("admin_system: the core is not ready - the plugin runs as a no-op");
-			return plg::PluginResult{};
+			// Fail soft: every handler is still registered below, the permission checks stay
+			// fail-closed while the core is missing (commands.cpp) and the per-second pump retries
+			// the schema. The API answers with neutral values until then.
+			LogError("admin_system: the core is not ready - the plugin retries the database in the background");
+			m_coreRetryAt = std::chrono::steady_clock::now() + std::chrono::seconds(m_coreRetryDelaySeconds);
 		}
 
-		// The s2sdk listeners of the original (authentication + disconnect) and the chat listener
-		// for gags/silences. Every direct s2sdk call is guarded: a missing binding must degrade to
-		// a no-op, never to a call through a null function pointer.
-		if (__s2sdk_OnClientAuthenticated_Register && __s2sdk_OnClientAuthenticated_Unregister &&
-			__s2sdk_OnClientDisconnect_Register && __s2sdk_OnClientDisconnect_Unregister) {
-			s2sdk::OnClientAuthenticated_Register(&OnClientAuthenticatedListener);
-			s2sdk::OnClientDisconnect_Register(&OnClientDisconnectListener);
-			m_listenersRegistered = true;
+		// The map gate first: every client/entity call below is behind it (PITFALLS B1/B2).
+		SetMapLifecycleCallbacks(&OnMapGateStart, &OnMapGateEnd);
+		InitMapGate();
+
+		// The s2sdk listeners of the original (authentication + disconnect) and the chat listeners
+		// for gags/silences. Every registration is guarded: a missing binding must degrade to a
+		// no-op, never to a call through a null function pointer, and both halves of every pair are
+		// required before anything is registered (PITFALLS A7).
+		if (__s2sdk_OnClientAuthenticated_Register != nullptr && __s2sdk_OnClientAuthenticated_Unregister != nullptr) {
+			try {
+				s2sdk::OnClientAuthenticated_Register(&OnClientAuthenticatedListener);
+				m_authenticatedListenerRegistered = true;
+			} catch (...) {
+				LogError("admin_system: registering the s2sdk OnClientAuthenticated listener failed - the "
+						 "reconcile loop still loads admins and punishments");
+			}
 		} else {
-			LogError("admin_system: the s2sdk client listeners are not available - admins and punishments are only "
-					 "loaded by the reconcile loop");
+			LogError("admin_system: the s2sdk OnClientAuthenticated listener is not available - admins and "
+					 "punishments are only loaded by the reconcile loop");
 		}
-		pisex::AddChatListenerPre([](int slot, const char* content, bool team) {
-			return g_adminPlugin.OnChatPre(slot, content, team);
-		});
+		if (__s2sdk_OnClientDisconnect_Register != nullptr && __s2sdk_OnClientDisconnect_Unregister != nullptr) {
+			try {
+				s2sdk::OnClientDisconnect_Register(&OnClientDisconnectListener);
+				m_disconnectListenerRegistered = true;
+			} catch (...) {
+				LogError("admin_system: registering the s2sdk OnClientDisconnect listener failed - a slot is "
+						 "dropped by the reconcile loop instead");
+			}
+		} else {
+			LogError("admin_system: the s2sdk OnClientDisconnect listener is not available - a slot is dropped "
+					 "by the reconcile loop instead");
+		}
+		if (__s2sdk_AddCommandListener != nullptr && __s2sdk_RemoveCommandListener != nullptr) {
+			try {
+				if (s2sdk::AddCommandListener(plg::string("say"), &OnSayListener, s2sdk::HookMode::Pre)) {
+					m_sayListenerRegistered = true;
+				} else {
+					LogError("admin_system: could not listen on 'say' - the mute/gag chat block is not applied");
+				}
+			} catch (...) {
+				LogError("admin_system: registering the 'say' listener failed - the mute/gag chat block is not "
+						 "applied");
+			}
+			try {
+				if (s2sdk::AddCommandListener(plg::string("say_team"), &OnSayListener, s2sdk::HookMode::Pre)) {
+					m_sayTeamListenerRegistered = true;
+				} else {
+					LogError("admin_system: could not listen on 'say_team' - the mute/gag chat block is not applied");
+				}
+			} catch (...) {
+				LogError("admin_system: registering the 'say_team' listener failed - the mute/gag chat block is "
+						 "not applied");
+			}
+		} else {
+			LogError("admin_system: AddCommandListener/RemoveCommandListener is unavailable - the mute/gag chat "
+					 "block is not applied");
+		}
 
 		RegisterCommands();  // commands.cpp
 		RegisterCoreMenus();
 		RegisterStaticNameHooks();
-
-		// Everything that needs a map (and the deferred startup work of Pisex):
-		pisex::g_pUtils->StartupServer([] {
-			try {
-				g_adminPlugin.Core().RemoveExpiredAdmins();
-				g_adminPlugin.BroadcastCoreLoaded();
-				g_adminPlugin.ReconcileSlots();
-			} catch (const std::exception& ex) {
-				LogError(std::string("admin_system: exception in the startup callback: ") + ex.what());
-			} catch (...) {
-				LogError("admin_system: unknown exception in the startup callback");
-			}
-		});
-
-		// The one-second timer of the original (punishment/admin expiry) plus the reconcile.
-		m_secondTimer = pisex::g_pUtils->CreateTimer(kSecondTimerInterval, [] {
-			try {
-				g_adminPlugin.OnSecondTick();
-			} catch (const std::exception& ex) {
-				LogError(std::string("admin_system: exception in the second timer: ") + ex.what());
-			} catch (...) {
-				LogError("admin_system: unknown exception in the second timer");
-			}
-			return kSecondTimerInterval;
-		});
+		// The native menu layer: burns MenuId 0 when the full lifecycle bindings are present.
+		StartMenuLayer(&g_adminPlugin, &MenuOwnerEligibleTrampoline);
 
 		LogInfo("admin_system: plugin started (prefix '" + m_config.database_prefix + "', servers " +
-				std::to_string(m_config.admin_server_id) + "/" + std::to_string(m_config.punish_server_id) + ")");
+				std::to_string(m_config.admin_server_id) + "/" + std::to_string(m_config.punish_server_id) +
+				", language '" + m_language + "')");
 	} catch (const std::exception& ex) {
 		LogError(std::string("admin_system: exception in OnPluginStart: ") + ex.what());
 	} catch (...) {
 		LogError("admin_system: unknown exception in OnPluginStart");
 	}
-	(void)m_secondTimer;
-	return plg::PluginResult{};
+	return plg::PluginResult{}; // never Failed (PITFALLS A1)
 }
 
 plg::PluginResult AdminPlugin::OnPluginUpdate(std::chrono::milliseconds dt) {
 	try {
-		// pisexcompat first: it applies the deferred startup callbacks, the timer reschedules and
-		// the menu requests that came out of engine callbacks (which run under s2sdk's locks).
-		pisex::Poll();
+		// Opens the gate on the first update after a mid-map load; after OnMapEnd only a new
+		// OnMapStart opens it again (PITFALLS B1/B2).
+		PollMapGate();
+		// The database pump: completed statements run their callbacks here, on the game thread.
+		// Every callback that could reach a client checks the map gate itself (admin_guards).
 		if (m_db != nullptr) {
 			m_db->Poll();
 		}
-		// Fallback for a server whose s2sdk timer binding is missing: keep the one-second work
-		// (expiry, reconcile) running from the update pump.
-		if (m_secondTimer == nullptr) {
-			m_updateAccumulator += dt;
-			if (m_updateAccumulator >= std::chrono::seconds(1)) {
-				m_updateAccumulator = std::chrono::milliseconds(0);
-				OnSecondTick();
-			}
+		// Queued menu actions/displays and the ended menus. Drained even with the gate closed: the
+		// closed branch only retries the safe destroy path (no client call).
+		ProcessMenuRequests();
+		if (!IsMapReady()) {
+			return plg::PluginResult{};
+		}
+		// The original's StartupServer work, once both the map and the core are ready.
+		RunStartupWork();
+		// Ban-delay kicks (the original used a Pisex timer; PITFALLS C9 forbids s2sdk timers here).
+		ProcessPendingKicks();
+		// The one-second pump of the original: punishment/admin expiry, the reconcile and the
+		// database retry. No s2sdk timer is involved.
+		m_updateAccumulator += dt;
+		if (m_updateAccumulator >= std::chrono::seconds(1)) {
+			m_updateAccumulator = std::chrono::milliseconds(0);
+			OnSecondTick();
 		}
 	} catch (const std::exception& ex) {
 		LogError(std::string("admin_system: exception in OnPluginUpdate: ") + ex.what());
@@ -524,30 +582,137 @@ plg::PluginResult AdminPlugin::OnPluginUpdate(std::chrono::milliseconds dt) {
 }
 
 plg::PluginResult AdminPlugin::OnPluginEnd() {
-	try {
-		if (m_listenersRegistered) {
-			s2sdk::OnClientAuthenticated_Unregister(&OnClientAuthenticatedListener);
-			s2sdk::OnClientDisconnect_Unregister(&OnClientDisconnectListener);
-			m_listenersRegistered = false;
+	// Symmetric teardown (PITFALLS A7). Each step is guarded: the remaining registrations must
+	// still be dropped even when one of them fails.
+	if (m_authenticatedListenerRegistered) {
+		m_authenticatedListenerRegistered = false;
+		try {
+			if (__s2sdk_OnClientAuthenticated_Unregister != nullptr) {
+				s2sdk::OnClientAuthenticated_Unregister(&OnClientAuthenticatedListener);
+			}
+		} catch (...) {
 		}
-		UnregisterCommands(); // as_status is an s2sdk command, pisex::Shutdown() does not know it
-		pisex::Shutdown();
-		// The core has to go before the database (its callbacks hold a lifetime token).
-		m_core.reset();
-		m_db.reset();
-		m_coreLoaded = false;
-	} catch (const std::exception& ex) {
-		LogError(std::string("admin_system: exception in OnPluginEnd: ") + ex.what());
-	} catch (...) {
-		LogError("admin_system: unknown exception in OnPluginEnd");
 	}
+	if (m_disconnectListenerRegistered) {
+		m_disconnectListenerRegistered = false;
+		try {
+			if (__s2sdk_OnClientDisconnect_Unregister != nullptr) {
+				s2sdk::OnClientDisconnect_Unregister(&OnClientDisconnectListener);
+			}
+		} catch (...) {
+		}
+	}
+	if (m_sayListenerRegistered) {
+		m_sayListenerRegistered = false;
+		try {
+			if (__s2sdk_RemoveCommandListener != nullptr) {
+				s2sdk::RemoveCommandListener(plg::string("say"), &OnSayListener, s2sdk::HookMode::Pre);
+			}
+		} catch (...) {
+		}
+	}
+	if (m_sayTeamListenerRegistered) {
+		m_sayTeamListenerRegistered = false;
+		try {
+			if (__s2sdk_RemoveCommandListener != nullptr) {
+				s2sdk::RemoveCommandListener(plg::string("say_team"), &OnSayListener, s2sdk::HookMode::Pre);
+			}
+		} catch (...) {
+		}
+	}
+	UnregisterCommands(); // every console command / command listener of commands.cpp
+	if (m_staticNameCommandRegistered) {
+		m_staticNameCommandRegistered = false;
+		try {
+			if (__s2sdk_RemoveCommandListener != nullptr) {
+				s2sdk::RemoveCommandListener(plg::string(), &OnStaticNameCommandListener, s2sdk::HookMode::Pre);
+			}
+		} catch (...) {
+		}
+	}
+	if (m_roundStartHooked) {
+		m_roundStartHooked = false;
+		try {
+			if (__s2sdk_UnhookEvent != nullptr) {
+				s2sdk::UnhookEvent(plg::string("round_start"), &OnRoundStartEvent, s2sdk::HookMode::Pre);
+			}
+		} catch (...) {
+		}
+	}
+	// Destroy every menu while the map gate still tells the layer whether a backend close is safe.
+	try {
+		ShutdownMenuLayer();
+	} catch (...) {
+	}
+	try {
+		SetMapLifecycleCallbacks(nullptr, nullptr);
+		ShutdownMapGate();
+	} catch (...) {
+	}
+	// The core has to go before the database (its callbacks hold a lifetime token).
+	m_core.reset();
+	m_db.reset();
+	m_coreLoaded = false;
+	m_coreReady = false;
+	m_coreProbePending = false;
+	ClearPendingKicks();
+	for (SlotState& state : m_slots) {
+		state = SlotState{};
+	}
+	for (OwnReasonState& own : m_ownReasons) {
+		own = OwnReasonState{};
+	}
+	for (std::string& category : m_lastCategory) {
+		category.clear();
+	}
+	m_updateAccumulator = std::chrono::milliseconds(0);
+	m_sinceReconcile = std::chrono::milliseconds(0);
 	return plg::PluginResult{};
+}
+
+// --- map gate hooks ------------------------------------------------------------------------
+
+void AdminPlugin::OnMapStartHook() {
+	// A new map: the per-second pump starts from a clean accumulator (no client call here).
+	m_updateAccumulator = std::chrono::milliseconds(0);
+	m_sinceReconcile = std::chrono::milliseconds(0);
+}
+
+void AdminPlugin::OnMapEndHook() {
+	// PITFALLS B2: from here until the next OnMapStart the client list is torn down - only state
+	// is dropped, nothing is queried and nothing is printed.
+	for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
+		ClearSlot(slot, "map end");
+	}
+	m_updateAccumulator = std::chrono::milliseconds(0);
+	m_sinceReconcile = std::chrono::milliseconds(0);
+	// Menus: cancel-confirmed teardown only (no client call with the map down, PITFALLS C10).
+	CloseMenusOnMapEnd();
 }
 
 // --- engine side -------------------------------------------------------------------------
 
 void AdminPlugin::HandleClientAuthenticated(int32_t playerSlot, uint64_t steamid) {
-	if (m_core == nullptr || playerSlot < 0 || playerSlot >= kMaxSlots) {
+	if (m_core == nullptr || !m_coreReady || !IsMapReady() || playerSlot < 0 || playerSlot >= kMaxSlots) {
+		return;
+	}
+	// The event documents "Steam account ID or 0 if not available" and can fire before the
+	// client is fully connected (perm_connector guards it the same way): prefer the client's
+	// canonical SteamID64, and let the reconcile load a slot whose id is still a 32-bit account
+	// id - otherwise the wrong key is queried and the slot is reloaded a second later.
+	const uint64_t canonical = ClientSteamID64(playerSlot);
+	if (canonical != 0) {
+		if (steamid != 0 && steamid != canonical) {
+			LogMessage("admin_system: OnClientAuthenticated reported " + std::to_string(steamid) + " for slot " +
+						   std::to_string(playerSlot) + ", but the client's SteamID64 is " +
+						   std::to_string(canonical) + " - using the latter",
+					   plg::Severity::Warning);
+		}
+		steamid = canonical;
+	} else if (steamid < (1ull << 32)) {
+		return; // 0 or a 32-bit account id: not a SteamID64, wait for the reconcile
+	}
+	if (steamid == 0) {
 		return;
 	}
 	SlotState& state = m_slots[static_cast<size_t>(playerSlot)];
@@ -556,12 +721,14 @@ void AdminPlugin::HandleClientAuthenticated(int32_t playerSlot, uint64_t steamid
 	}
 	state.steamid = steamid;
 	state.requested = true;
-	state.name = pisex::g_pPlayers->GetPlayerName(playerSlot);
-	state.requestedAt = std::chrono::steady_clock::now();
+	state.punishmentsLoaded = false;
+	state.name = ClientName(playerSlot);
+	state.retryDelay = std::chrono::seconds(0);
+	state.retryAt = std::chrono::steady_clock::now() + kLoadRetryInitial;
 
 	// CheckPunishments() + CheckPermissions() of the original's OnClientAuthorized/ClientConnect.
 	m_core->ResetSlot(playerSlot);
-	m_core->LoadPunishments(playerSlot, steamid, pisex::g_pPlayers->GetIpAddress(playerSlot));
+	m_core->LoadPunishments(playerSlot, steamid, ClientIp(playerSlot));
 	m_core->LoadAdmin(playerSlot, steamid, state.name);
 }
 
@@ -569,7 +736,9 @@ void AdminPlugin::HandleClientDisconnect(int32_t playerSlot) {
 	if (playerSlot < 0 || playerSlot >= kMaxSlots) {
 		return;
 	}
-	// The original kept the last players around for the offline menus.
+	// The original kept the last players around for the offline menus. Only the tracked state is
+	// read here - the disconnect event fires while the client is still valid, but the map gate may
+	// already be closed (changelevel), so no s2sdk client call is made.
 	const SlotState& state = m_slots[static_cast<size_t>(playerSlot)];
 	if (m_core != nullptr && state.steamid != 0) {
 		OfflineUser user;
@@ -593,6 +762,9 @@ void AdminPlugin::HandleClientDisconnect(int32_t playerSlot) {
 
 void AdminPlugin::ClearSlot(int32_t playerSlot, const char* reason) {
 	(void)reason;
+	if (playerSlot < 0 || playerSlot >= kMaxSlots) {
+		return;
+	}
 	m_slots[static_cast<size_t>(playerSlot)] = SlotState{};
 	m_ownReasons[static_cast<size_t>(playerSlot)] = OwnReasonState{};
 	m_lastCategory[static_cast<size_t>(playerSlot)].clear();
@@ -602,11 +774,10 @@ void AdminPlugin::ClearSlot(int32_t playerSlot, const char* reason) {
 }
 
 bool AdminPlugin::IsSlotHuman(int32_t slot) const {
-	if (slot < 0 || slot >= kMaxSlots || !pisex::IsGameReady()) {
+	if (slot < 0 || slot >= kMaxSlots || !IsMapReady()) {
 		return false;
 	}
-	return pisex::g_pPlayers->IsConnected(slot) && pisex::g_pPlayers->IsAuthenticated(slot) &&
-		   !pisex::g_pPlayers->IsFakeClient(slot);
+	return HasClient(slot) && IsAuthorizedSlot(slot) && !IsFakeClientSlot(slot);
 }
 
 uint64_t AdminPlugin::SlotSteamId(int32_t slot) const {
@@ -614,7 +785,7 @@ uint64_t AdminPlugin::SlotSteamId(int32_t slot) const {
 		return 0;
 	}
 	if (IsSlotHuman(slot)) {
-		if (const uint64_t live = pisex::g_pPlayers->GetSteamID64(slot); live != 0) {
+		if (const uint64_t live = ClientSteamID64(slot); live != 0) {
 			return live;
 		}
 	}
@@ -626,22 +797,22 @@ PlayerIdentity AdminPlugin::IdentityOf(int32_t slot) const {
 	player.slot = slot;
 	player.steamid = SlotSteamId(slot);
 	if (slot >= 0 && slot < kMaxSlots) {
-		player.name = pisex::g_pPlayers->GetPlayerName(slot);
+		player.name = ClientName(slot);
 		if (player.name.empty()) {
 			player.name = m_slots[static_cast<size_t>(slot)].name;
 		}
-		player.ip = pisex::g_pPlayers->GetIpAddress(slot);
+		player.ip = ClientIp(slot);
 	}
 	return player;
 }
 
 void AdminPlugin::ReconcileSlots() {
-	if (m_core == nullptr || !pisex::IsGameReady()) {
+	if (m_core == nullptr || !m_coreReady || !IsMapReady()) {
 		return;
 	}
 	for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
 		try {
-			if (!pisex::g_pPlayers->IsConnected(slot)) {
+			if (!HasClient(slot)) {
 				if (m_slots[static_cast<size_t>(slot)].steamid != 0) {
 					// No disconnect event (or a reused slot): drop the tracked state.
 					ClearSlot(slot, "gone");
@@ -651,31 +822,64 @@ void AdminPlugin::ReconcileSlots() {
 			if (!IsSlotHuman(slot)) {
 				continue;
 			}
-			const uint64_t steamid = pisex::g_pPlayers->GetSteamID64(slot);
+			const uint64_t steamid = ClientSteamID64(slot);
 			if (steamid == 0) {
 				continue;
 			}
 			SlotState& state = m_slots[static_cast<size_t>(slot)];
+			const auto now = std::chrono::steady_clock::now();
 			if (state.requested && state.steamid == steamid) {
-				// A load that never answered (a database hiccup) is retried every 10 seconds;
-				// the core only reports a *finished* punishment load, so that is the signal.
-				const bool stuck = !state.punishmentsLoaded &&
-								   std::chrono::steady_clock::now() - state.requestedAt > std::chrono::seconds(10);
-				if (!stuck) {
+				// Punishments and admin rights are two separate statements with two separate
+				// completion signals: the punishment load reports through onPunishmentsLoaded,
+				// the admin load through the core's per-slot load state. The engine-free
+				// DecideSlotRetry() (admin_core.hpp) owns the rule - it is unit-tested, so the
+				// loop cannot drift from the covered behaviour:
+				//   * both answered -> settle and reset the backoff;
+				//   * a load in flight from outside the loop (a reload/add command calls
+				//     LoadAdmin()/ReloadPunishments() directly) -> arm one full window, never a
+				//     duplicate SELECT that would supersede the in-flight one by request id;
+				//   * a load still unanswered when its window expires -> retry only the statement
+				//     that is missing, with the 10/20/40/60 backoff;
+				//   * the worker queue is saturated -> do nothing at all.
+				const AdminLoadSnapshot adminLoad = m_core->LoadSnapshot(slot);
+				const SlotRetryDecision decision =
+					DecideSlotRetry(state.punishmentsLoaded, adminLoad, steamid, now, state.retryAt,
+									state.retryDelay, m_db->Pending());
+				ApplySlotRetryDecision(decision, now, state.retryAt, state.retryDelay);
+				if (decision.action == SlotRetryAction::Settled ||
+					decision.action == SlotRetryAction::Wait ||
+					decision.action == SlotRetryAction::ArmDeadline) {
+					// The clock change (settle reset / the freshly armed window) is already applied.
 					continue;
 				}
-				LogError("admin_system: the load of slot " + std::to_string(slot) +
-						 " did not answer within 10s - requesting it again");
+				LogError("admin_system: the load of slot " + std::to_string(slot) + " did not answer (" +
+						 (decision.action == SlotRetryAction::ReloadAdmin
+							  ? std::string("admin")
+							  : decision.action == SlotRetryAction::ReloadPunishments ? std::string("punishments")
+																					 : std::string("punishments/admin")) +
+						 ") - requesting it again in " + std::to_string(state.retryDelay.count()) + "s");
+				// No ResetSlot() here: the slot still belongs to the same player, and wiping its
+				// admin rights and punishments on every retry would strip a live admin while the
+				// database is unreachable.
+				state.name = ClientName(slot);
+				if (decision.action != SlotRetryAction::ReloadAdmin) {
+					m_core->LoadPunishments(slot, steamid, ClientIp(slot));
+				}
+				if (decision.action != SlotRetryAction::ReloadPunishments) {
+					m_core->LoadAdmin(slot, steamid, state.name);
+				}
+				continue;
 			}
 			// OnClientAuthenticated is not always delivered, so this is the reliable path - and
 			// it also covers players that were already connected when the plugin was loaded.
 			state.steamid = steamid;
 			state.requested = true;
 			state.punishmentsLoaded = false;
-			state.name = pisex::g_pPlayers->GetPlayerName(slot);
-			state.requestedAt = std::chrono::steady_clock::now();
+			state.name = ClientName(slot);
+			state.retryDelay = std::chrono::seconds(0);
+			state.retryAt = now + kLoadRetryInitial;
 			m_core->ResetSlot(slot);
-			m_core->LoadPunishments(slot, steamid, pisex::g_pPlayers->GetIpAddress(slot));
+			m_core->LoadPunishments(slot, steamid, ClientIp(slot));
 			m_core->LoadAdmin(slot, steamid, state.name);
 		} catch (const std::exception& ex) {
 			LogError("admin_system: reconcile of slot " + std::to_string(slot) + " failed: " + ex.what());
@@ -686,21 +890,26 @@ void AdminPlugin::ReconcileSlots() {
 }
 
 void AdminPlugin::OnSecondTick() {
-	if (m_core == nullptr) {
+	if (!IsMapReady()) {
 		return;
 	}
-	if (!pisex::IsGameReady()) {
-		return;
+	if (!m_coreReady) {
+		// The database was down at plugin start (or a retry is pending): keep trying so the
+		// core and its commands become usable without a manual reload.
+		RetryCore();
+		if (!m_coreReady) {
+			return;
+		}
 	}
 	// The per-second timer of the original: forget punishments and admin rights that expired.
 	const ExpiryOutcome outcome = m_core->ExpireState();
 	for (const ExpiryOutcome::ExpiredPunishment& expired : outcome.punishments) {
-		pisex::g_pUtils->PrintToChat(expired.slot, Phrase("MuteExpired"));
+		PrintChat(expired.slot, "%s", Phrase("MuteExpired"));
 		// PARITY: the original notified its listeners with admin id -1 for an expiry.
 		HandlePlayerUnpunish(expired.slot, expired.type, -1);
 	}
 	for (const int slot : outcome.admins) {
-		pisex::g_pUtils->PrintToChat(slot, Phrase("AdminExpired"));
+		PrintChat(slot, "%s", Phrase("AdminExpired"));
 	}
 
 	m_sinceReconcile += std::chrono::seconds(1);
@@ -739,9 +948,8 @@ bool AdminPlugin::OnChatPre(int32_t playerSlot, const char* content, bool team) 
 			return !m_config.mute_ignore_commands;
 		}
 		const int type = m_core->IsPunished(playerSlot, RT_GAG) ? RT_GAG : RT_SILENCE;
-		pisex::g_pUtils->PrintToChat(playerSlot, Phrase("MuteActiveChat"),
-									 CStr(std::string(m_core->PunishmentReason(playerSlot, type))),
-									 CStr(FormatTime(m_core->PunishmentExpires(playerSlot, type))));
+		PrintChat(playerSlot, Phrase("MuteActiveChat"), CStr(std::string(m_core->PunishmentReason(playerSlot, type))),
+				  CStr(FormatTime(m_core->PunishmentExpires(playerSlot, type))));
 		return false;
 	} catch (const std::exception& ex) {
 		LogError(std::string("admin_system: exception in the chat listener: ") + ex.what());
@@ -770,10 +978,20 @@ void AdminPlugin::HandleAdminLoaded(int32_t slot, const AdminRecord& admin) {
 }
 
 void AdminPlugin::HandlePunishmentsLoaded(int32_t slot, const PunishmentLoadOutcome& outcome) {
-	if (slot < 0 || slot >= kMaxSlots) {
+	if (slot < 0 || slot >= kMaxSlots || m_core == nullptr) {
 		return;
 	}
-	m_slots[static_cast<size_t>(slot)].punishmentsLoaded = true;
+	SlotState& state = m_slots[static_cast<size_t>(slot)];
+	state.punishmentsLoaded = true;
+	// The slot is settled only when BOTH statements answered: the punishment load (this callback)
+	// and the admin load of the same steamid (the core's per-slot state). Until then the backoff
+	// of the pending retry stays, so the admin-only retry keeps its 10/20/40/60 s spacing instead
+	// of being re-armed every time a punishment load finishes.
+	const AdminLoadSnapshot adminLoad = m_core->LoadSnapshot(slot);
+	if (adminLoad.state == AdminLoadState::Ready && adminLoad.steamid == state.steamid) {
+		state.retryDelay = std::chrono::seconds(0);
+		state.retryAt = {};
+	}
 	// CheckPunishments(): a ban disconnects the player - immediately on connect (the original did
 	// that inside the query callback) and after ban_delay when the punishments were reloaded.
 	// The load was requested for the player the slot held (a load of a slot that was reclaimed
@@ -784,31 +1002,55 @@ void AdminPlugin::HandlePunishmentsLoaded(int32_t slot, const PunishmentLoadOutc
 }
 
 void AdminPlugin::KickForBan(int32_t slot, bool delayed, uint64_t steamid) {
-	if (slot < 0 || slot >= kMaxSlots) {
-		return;
-	}
-	if (!__s2sdk_KickClient) {
+	if (slot < 0 || slot >= kMaxSlots || steamid == 0 || __s2sdk_KickClient == nullptr) {
 		return; // no s2sdk: the punishment is stored, the disconnect has to happen elsewhere
 	}
 	// KickClient is g_pEngineServer->DisconnectClient with no validation of its own: it kicks
 	// whoever the slot holds at that moment. The slot is reused as soon as the punished player
-	// leaves and the ban_delay timer even survives a map change (the punishment load is
+	// leaves and the ban_delay kick even survives a map change (the punishment load is
 	// asynchronous too), so the kick only fires while the slot still carries the punished
-	// steamid. GetSteamID64 needs a connected client but no controller, so a player who is still
-	// connecting is matched as well; a ban whose player is not in the slot is enforced again on
-	// the next connect.
-	if (!delayed || m_config.ban_delay <= 0) {
-		if (steamid != 0 && pisex::g_pPlayers->GetSteamID64(slot) == steamid) {
-			s2sdk::KickClient(slot, s2sdk::NetworkDisconnectionReason::Kickbanadded, plg::string());
+	// steamid. ClientSteamID64 needs a connected client but no controller, so a player who is
+	// still connecting is matched as well; a ban whose player is not in the slot is enforced
+	// again on the next connect.
+	const bool immediate = !delayed || m_config.ban_delay <= 0;
+	if (immediate) {
+		if (IsMapReady() && ClientSteamID64(slot) == steamid) {
+			KickClientSlot(slot, static_cast<int32_t>(s2sdk::NetworkDisconnectionReason::Kickbanadded));
 		}
 		return;
 	}
-	pisex::g_pUtils->CreateTimer(static_cast<float>(m_config.ban_delay), [slot, steamid] {
-		if (__s2sdk_KickClient && steamid != 0 && pisex::g_pPlayers->GetSteamID64(slot) == steamid) {
-			s2sdk::KickClient(slot, s2sdk::NetworkDisconnectionReason::Kickbanadded, plg::string());
+	// The original used a Pisex timer; the plugin runs no s2sdk timers (PITFALLS C9), so the
+	// deadline is queued and checked from OnPluginUpdate.
+	PendingKick pending;
+	pending.slot = slot;
+	pending.steamid = steamid;
+	pending.due = std::chrono::steady_clock::now() + std::chrono::seconds(m_config.ban_delay);
+	m_pendingKicks.push_back(pending);
+}
+
+void AdminPlugin::ProcessPendingKicks() {
+	if (m_pendingKicks.empty() || !IsMapReady()) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	std::vector<PendingKick> remaining;
+	remaining.reserve(m_pendingKicks.size());
+	for (const PendingKick& kick : m_pendingKicks) {
+		if (now < kick.due) {
+			remaining.push_back(kick);
+			continue;
 		}
-		return -1.0f; // one shot
-	});
+		// Only kick while the slot still carries the punished steamid; otherwise the ban is
+		// enforced again on the next connect.
+		if (ClientSteamID64(kick.slot) == kick.steamid) {
+			KickClientSlot(kick.slot, static_cast<int32_t>(s2sdk::NetworkDisconnectionReason::Kickbanadded));
+		}
+	}
+	m_pendingKicks = std::move(remaining);
+}
+
+void AdminPlugin::ClearPendingKicks() {
+	m_pendingKicks.clear();
 }
 
 void AdminPlugin::HandlePlayerPunish(int32_t slot, int32_t type, int32_t time, const std::string& reason, int32_t adminRef) {
@@ -869,7 +1111,7 @@ void AdminPlugin::HandleOfflinePlayerUnpunish(const std::string& steamid64, int3
 }
 
 void AdminPlugin::HandleCoreError(std::string_view message) {
-	pisex::ErrorLog("%.*s", static_cast<int>(message.size()), message.data());
+	LogError(message);
 }
 
 // --- notifications (SendPunishmentNotification of the original) ------------------------------
@@ -913,7 +1155,7 @@ std::string AdminPlugin::AdminName(int32_t adminRef) const {
 			admin != nullptr && !admin->name.empty()) {
 			return admin->name;
 		}
-		const std::string live = pisex::g_pPlayers->GetPlayerName(adminRef);
+		const std::string live = ClientName(adminRef);
 		if (!live.empty()) {
 			return live;
 		}
@@ -935,10 +1177,10 @@ void AdminPlugin::SendPunishmentNotification(int32_t slot, int32_t type, int32_t
 	default: return;
 	}
 	const std::string admin = AdminName(adminRef);
-	const std::string target = pisex::g_pPlayers->GetPlayerName(slot);
+	const std::string target = ClientName(slot);
 	const std::string duration = FormatTime(time == 0 ? 0 : static_cast<int64_t>(std::time(nullptr)) + time);
 	if (m_config.notify_type == 1) {
-		pisex::g_pUtils->PrintToChat(slot, Phrase(message), CStr(duration), CStr(reason), CStr(admin));
+		PrintChat(slot, Phrase(message), CStr(duration), CStr(reason), CStr(admin));
 		if (adminRef >= 0 && adminRef < kMaxSlots) {
 			const char* adminMessage = nullptr;
 			switch (type) {
@@ -948,11 +1190,11 @@ void AdminPlugin::SendPunishmentNotification(int32_t slot, int32_t type, int32_t
 			case RT_SILENCE: adminMessage = "NewSilenceMessageAdmin"; break;
 			default: return;
 			}
-			pisex::g_pUtils->PrintToChat(adminRef, Phrase(adminMessage), CStr(target), CStr(duration), CStr(reason));
+			PrintChat(adminRef, Phrase(adminMessage), CStr(target), CStr(duration), CStr(reason));
 		}
 		return;
 	}
-	pisex::g_pUtils->PrintToChatAll(Phrase(message), CStr(admin), CStr(target), CStr(duration), CStr(reason));
+	PrintChatAll(Phrase(message), CStr(admin), CStr(target), CStr(duration), CStr(reason));
 }
 
 void AdminPlugin::SendUnpunishmentNotification(int32_t slot, int32_t type, int32_t adminRef) const {
@@ -967,15 +1209,14 @@ void AdminPlugin::SendUnpunishmentNotification(int32_t slot, int32_t type, int32
 	case RT_SILENCE: message = "UnsilenceMessageAll"; break;
 	default: return;
 	}
-	pisex::g_pUtils->PrintToChatAll(Phrase(message), CStr(AdminName(adminRef)),
-									CStr(pisex::g_pPlayers->GetPlayerName(slot)));
+	PrintChatAll(Phrase(message), CStr(AdminName(adminRef)), CStr(ClientName(slot)));
 }
 
 // --- punishment flows ------------------------------------------------------------------------
 
 bool AdminPlugin::AddPlayerPunishment(const PlayerIdentity& player, int32_t type, int32_t time, const std::string& reason,
 									  int32_t adminRef, bool notify, bool db) {
-	if (m_core == nullptr) {
+	if (m_core == nullptr || !m_coreReady) {
 		return false;
 	}
 	if (notify) {
@@ -992,7 +1233,7 @@ bool AdminPlugin::AddPlayerPunishment(const PlayerIdentity& player, int32_t type
 
 bool AdminPlugin::AddOfflinePlayerPunishment(const std::string& steamid64, const std::string& name, int32_t type,
 											 int32_t time, const std::string& reason, int32_t adminRef) {
-	if (m_core == nullptr) {
+	if (m_core == nullptr || !m_coreReady) {
 		return false;
 	}
 	m_core->PunishOffline(steamid64, name, type, time, reason, adminRef);
@@ -1001,7 +1242,7 @@ bool AdminPlugin::AddOfflinePlayerPunishment(const std::string& steamid64, const
 
 bool AdminPlugin::TryAddPunishment(const PlayerIdentity& player, int32_t type, int32_t time, const std::string& reason,
 								   int32_t adminRef, bool notify) {
-	if (m_core == nullptr) {
+	if (m_core == nullptr || !m_coreReady) {
 		return false;
 	}
 	// TryAddPunishment() of the original: the immunity rules come first, then the notification and
@@ -1025,14 +1266,17 @@ bool AdminPlugin::TryAddPunishment(const PlayerIdentity& player, int32_t type, i
 }
 
 void AdminPlugin::TryAddOfflinePunishment(const std::string& steamid64, const std::string& name, int32_t type,
-										  int32_t time, const std::string& reason, int32_t adminRef) {
-	if (m_core != nullptr) {
-		m_core->TryPunishOffline(steamid64, name, type, time, reason, adminRef);
+										  int32_t time, const std::string& reason, int32_t adminRef,
+										  std::function<void(bool)> onComplete) {
+	if (m_core != nullptr && m_coreReady) {
+		m_core->TryPunishOffline(steamid64, name, type, time, reason, adminRef, std::move(onComplete));
+	} else if (onComplete) {
+		onComplete(false);
 	}
 }
 
 void AdminPlugin::RemovePlayerPunishment(int32_t slot, int32_t type, int32_t adminRef, bool notify) {
-	if (m_core == nullptr) {
+	if (m_core == nullptr || !m_coreReady) {
 		return;
 	}
 	if (notify) {
@@ -1042,13 +1286,13 @@ void AdminPlugin::RemovePlayerPunishment(int32_t slot, int32_t type, int32_t adm
 }
 
 void AdminPlugin::TryRemovePunishment(int32_t slot, int32_t type, int32_t adminRef) {
-	if (m_core != nullptr) {
+	if (m_core != nullptr && m_coreReady) {
 		m_core->TryUnpunish(slot, type, adminRef);
 	}
 }
 
 void AdminPlugin::RemoveOfflinePlayerPunishment(const std::string& steamid64, int32_t type, int32_t adminRef) {
-	if (m_core != nullptr) {
+	if (m_core != nullptr && m_coreReady) {
 		m_core->UnpunishOffline(steamid64, type, adminRef);
 	}
 }
@@ -1057,6 +1301,15 @@ void AdminPlugin::RemoveOfflinePlayerPunishment(const std::string& steamid64, in
 
 bool AdminPlugin::IsAdminSlot(int32_t slot) const {
 	return m_core != nullptr && m_core->IsAdmin(slot);
+}
+
+bool AdminPlugin::IsMenuOwnerEligible(const OwnerIdentity& owner) const {
+	if (!owner.IsSet() || m_core == nullptr || !m_coreReady) {
+		return false;
+	}
+	// The core's answer is authoritative only for exactly this steamid; a false here means "ask
+	// again later", so the queued request is dropped instead of being applied to a stale slot.
+	return m_core->IsAdminDataReady(owner.slot, owner.steamId);
 }
 
 void AdminPlugin::SetLastCategory(int32_t slot, const std::string& category) {
@@ -1069,15 +1322,15 @@ void AdminPlugin::ReloadConfig() {
 	// OnReloadConfig of the original: the phrases, the flags and the menu tables are dropped and
 	// read again. The database connection stays (it was opened at plugin start).
 	LoadCoreConfig();
-	LoadPhrasesFiles();
+	LoadPhrases();
 	LoadSortingIni();
 	if (m_core != nullptr) {
 		m_core->SetConfig(m_config);
 	}
 	for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
 		// The rights of the online players are read again with the new flag mapping.
-		if (const uint64_t steamid = SlotSteamId(slot); steamid != 0 && m_core != nullptr) {
-			m_core->LoadAdmin(slot, steamid, pisex::g_pPlayers->GetPlayerName(slot));
+		if (const uint64_t steamid = SlotSteamId(slot); steamid != 0 && m_core != nullptr && m_coreReady) {
+			m_core->LoadAdmin(slot, steamid, ClientName(slot));
 		}
 	}
 }
@@ -1090,7 +1343,7 @@ const AdminRecord* AdminPlugin::FindAdmin(int32_t slot) const {
 
 void AdminPlugin::AddAdmin(std::string name, std::string steamid64, std::string flags, int immunity, int expireSeconds,
 						   int64_t groupId, std::string comment, bool db) {
-	if (m_core == nullptr || steamid64.empty()) {
+	if (m_core == nullptr || !m_coreReady || steamid64.empty()) {
 		return;
 	}
 	m_core->AddAdmin(std::move(name), std::move(steamid64), std::move(flags), immunity, expireSeconds, groupId,
@@ -1098,7 +1351,7 @@ void AdminPlugin::AddAdmin(std::string name, std::string steamid64, std::string 
 }
 
 void AdminPlugin::RemoveAdmin(const std::string& steamid64, bool db) {
-	if (m_core != nullptr) {
+	if (m_core != nullptr && m_coreReady) {
 		m_core->RemoveAdmin(steamid64, db);
 	}
 }
@@ -1172,11 +1425,14 @@ void AdminPlugin::PrintStatus(int32_t caller, s2sdk::ConCommandContext context) 
 									  std::to_string(m_config.admin_server_id) + " punish_server_id=" +
 									  std::to_string(m_config.punish_server_id) + " core_loaded=" +
 									  (m_coreLoaded ? "yes" : "no") +
-									  " db_pending=" + std::to_string(m_db->Pending())));
+									  " db_pending=" + std::to_string(m_db == nullptr ? 0 : m_db->Pending())));
 	int humans = 0;
 	for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
+		if (!IsMapReady()) {
+			break; // no map: not a single client call (PITFALLS B1/B2)
+		}
 		try {
-			if (!pisex::g_pPlayers->IsConnected(slot) || pisex::g_pPlayers->IsFakeClient(slot)) {
+			if (!HasClient(slot) || IsFakeClientSlot(slot)) {
 				continue;
 			}
 			const uint64_t steamid = SlotSteamId(slot);
@@ -1186,7 +1442,7 @@ void AdminPlugin::PrintStatus(int32_t caller, s2sdk::ConCommandContext context) 
 			++humans;
 			const AdminRecord* admin = m_core->FindAdmin(slot);
 			std::string line = "admin_system: slot " + std::to_string(slot) + ": steamid " + std::to_string(steamid) +
-							   " name='" + pisex::g_pPlayers->GetPlayerName(slot) + "'";
+							   " name='" + ClientName(slot) + "'";
 			if (admin != nullptr && admin->IsAdmin()) {
 				std::string flags;
 				for (const std::string& flag : admin->flags) {
@@ -1223,6 +1479,8 @@ void AdminPlugin::PrintStatus(int32_t caller, s2sdk::ConCommandContext context) 
 	s2sdk::ReplyToCommand(context, caller, plg::string("admin_system: --- as_status end ---"));
 }
 
+// --- s2sdk callbacks --------------------------------------------------------------------------
+
 namespace {
 
 void OnClientAuthenticatedListener(int32_t playerSlot, uint64_t steamid) {
@@ -1243,6 +1501,109 @@ void OnClientDisconnectListener(int32_t playerSlot, s2sdk::NetworkDisconnectionR
 		LogError(std::string("admin_system: exception in OnClientDisconnect: ") + ex.what());
 	} catch (...) {
 		LogError("admin_system: unknown exception in OnClientDisconnect");
+	}
+}
+
+// static_name = 1: the name of an admin is forced to the database name. "jointeam" reaches the
+// global listener (PITFALLS C11: the game parses it in its ClientCommand path, so it is not a
+// ConCommand), and answering Continue lets the engine's own handling run as before.
+s2sdk::ResultType OnStaticNameCommandListener(int32_t caller, s2sdk::ConCommandContext /*context*/,
+											  const plg::vector<plg::string>& args) {
+	try {
+		if (args.empty()) {
+			return s2sdk::ResultType::Continue;
+		}
+		const std::string_view name(args[0].data(), args[0].size());
+		if (name != "jointeam") {
+			return s2sdk::ResultType::Continue; // the original hooked only "jointeam"
+		}
+		if (IsSlotInRange(caller) && HasController(caller)) {
+			if (const AdminRecord* admin = g_adminPlugin.FindAdmin(caller);
+				admin != nullptr && admin->id > 0 && !admin->name.empty()) {
+				SetClientNameSafe(caller, admin->name);
+			}
+		}
+	} catch (const std::exception& ex) {
+		LogError(std::string("admin_system: exception in the static-name jointeam hook: ") + ex.what());
+	} catch (...) {
+		LogError("admin_system: unknown exception in the static-name jointeam hook");
+	}
+	return s2sdk::ResultType::Continue; // the original let the command through (MRES_IGNORED)
+}
+
+s2sdk::ResultType OnRoundStartEvent(const plg::string& /*name*/, void* /*event*/, bool /*dontBroadcast*/) {
+	try {
+		for (int32_t slot = 0; slot < kMaxSlots; ++slot) {
+			if (!HasClient(slot)) {
+				continue;
+			}
+			if (const AdminRecord* admin = g_adminPlugin.FindAdmin(slot);
+				admin != nullptr && admin->id > 0 && !admin->name.empty()) {
+				SetClientNameSafe(slot, admin->name);
+			}
+		}
+	} catch (const std::exception& ex) {
+		LogError(std::string("admin_system: exception in the static-name round_start hook: ") + ex.what());
+	} catch (...) {
+		LogError("admin_system: unknown exception in the static-name round_start hook");
+	}
+	return s2sdk::ResultType::Continue;
+}
+
+// The chat listeners of the original: s2sdk hands every say/say_team line here as
+// (say, first-token, rest...). The message is rebuilt without quoting, exactly like pisexcompat's
+// chat trampoline, so the gag/silence check and the own-reason capture see the text the player
+// typed and the first character test ('!'/'/') keeps working.
+s2sdk::ResultType OnSayListener(int32_t caller, s2sdk::ConCommandContext /*context*/,
+								const plg::vector<plg::string>& args) {
+	try {
+		if (args.size() < 2) {
+			return s2sdk::ResultType::Continue;
+		}
+		const bool team = std::string_view(args[0].data(), args[0].size()) == "say_team";
+		std::string content;
+		for (std::size_t i = 1; i < args.size(); ++i) {
+			if (i != 1) {
+				content.push_back(' ');
+			}
+			content.append(args[i].data(), args[i].size());
+		}
+		const bool allow = g_adminPlugin.OnChatPre(caller, content.c_str(), team);
+		return allow ? s2sdk::ResultType::Continue : s2sdk::ResultType::Handled;
+	} catch (const std::exception& ex) {
+		LogError(std::string("admin_system: exception in the chat listener: ") + ex.what());
+	} catch (...) {
+		LogError("admin_system: unknown exception in the chat listener");
+	}
+	return s2sdk::ResultType::Continue;
+}
+
+void OnMapGateStart() {
+	try {
+		g_adminPlugin.OnMapStartHook();
+	} catch (...) {
+	}
+}
+
+void OnMapGateEnd() {
+	try {
+		g_adminPlugin.OnMapEndHook();
+	} catch (const std::exception& ex) {
+		LogError(std::string("admin_system: exception in the map-end hook: ") + ex.what());
+	} catch (...) {
+		LogError("admin_system: unknown exception in the map-end hook");
+	}
+}
+
+bool MenuOwnerEligibleTrampoline(void* user, const OwnerIdentity& owner) {
+	const AdminPlugin* plugin = static_cast<const AdminPlugin*>(user);
+	if (plugin == nullptr) {
+		return false;
+	}
+	try {
+		return plugin->IsMenuOwnerEligible(owner);
+	} catch (...) {
+		return false;
 	}
 }
 
@@ -1271,7 +1632,7 @@ plg::vector<plg::string> ToPlgList(const std::vector<std::string>& values) {
 
 extern "C" PLUGIN_API float GetPluginVersion() {
 	try {
-		return 1.0f;
+		return 1.2f; // 1.2.0 (the original returned atof(plugin version))
 	} catch (...) {
 		return 0.0f;
 	}
@@ -1371,6 +1732,22 @@ extern "C" PLUGIN_API bool IsAdmin(int32_t slot) {
 	}
 }
 
+extern "C" PLUGIN_API bool IsClientAdminDataReady(int32_t slot, uint64_t steamid) {
+	try {
+		// False whenever the answer would not be authoritative: no core yet (database/schema not
+		// up, or the plugin is unloading), a slot the core does not track, a load that has not
+		// answered (Pending/Failed) and a steamid the current answer was not computed for (the
+		// slot was reclaimed by another player, or the caller does not know the identity yet).
+		// A consumer must not turn this false into "not an admin": it only says "ask again later".
+		// After it answers true, IsAdmin()/HasPermission()/HasFlag() are authoritative for this
+		// steamid - and they may still answer false (the player really is not an admin).
+		const AdminCore* core = g_adminPlugin.CoreOrNull();
+		return core != nullptr && core->IsAdminDataReady(slot, steamid);
+	} catch (...) {
+		return false;
+	}
+}
+
 extern "C" PLUGIN_API plg::string GetFlagName(const plg::string& flag) {
 	try {
 		return plg::string(g_adminPlugin.Cfg().FlagName(ToString(flag)));
@@ -1432,7 +1809,7 @@ extern "C" PLUGIN_API plg::string GetAdminName(int32_t slot) {
 			admin != nullptr && admin->id > 0 && !admin->name.empty()) {
 			return plg::string(admin->name);
 		}
-		return plg::string(pisex::g_pPlayers->GetPlayerName(slot));
+		return plg::string(ClientName(slot));
 	} catch (...) {
 		return {};
 	}

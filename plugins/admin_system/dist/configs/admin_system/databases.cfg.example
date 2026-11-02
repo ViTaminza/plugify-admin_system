@@ -5,6 +5,8 @@
 		// "mysql" (share the database with the Metamod server) or "sqlite" (local file, no server).
 		"driver"	"mysql"
 
+		// Fill these in on the server. They are deliberately empty in the template, and this file
+		// is only ever installed as databases.cfg.example (see the header of package.sh).
 		"host"		"127.0.0.1"
 		"port"		"3306"
 		"user"		""
